@@ -1,0 +1,42 @@
+# Runtime dependencies for the Model Serving container.
+#
+# `deploy/log_and_deploy.py` passes this file to `mlflow.pyfunc.log_model(
+# pip_requirements=...)`, so it is baked into the model artifact and is what the
+# endpoint installs. `pyproject.toml` mirrors it for local development and CI;
+# change both together.
+#
+# **Pinned exactly, on purpose.** With `>=` floors, two deploys a week apart can
+# resolve to different builds of langgraph, langchain and psycopg with nothing
+# recording the difference — the endpoint that passed evaluation and the
+# endpoint serving traffic are then not demonstrably the same software. Exact
+# pins make the model artifact reproducible and are what lets the supply-chain
+# scan in CI be read as a statement about production rather than about whatever
+# resolved that morning.
+#
+# To move a pin: raise it here and in pyproject.toml, run the suite, deploy to
+# dev, and check the endpoint's build log for a resolution conflict before prod.
+
+# 3.15+ for register_prompt(response_format=, model_config=) — the structured
+# output contract and run parameters ship with each prompt version.
+mlflow==3.15.1
+# 1.2+ for typed v2 streaming (agent.predict_stream) on top of the 1.0 APIs the
+# graph already depends on: Command destinations, Runtime context, RetryPolicy,
+# durability=, and the custom/messages stream modes the task plan uses.
+langgraph==1.2.11
+langchain-core==1.5.3
+# `init_chat_model` — the provider is configuration, not code (model_provider.py).
+langchain==1.2.10
+# [memory] pulls the Lakebase checkpointer/store extras (connection pool with
+# rotating OAuth credentials) — memory.py's production mode depends on them.
+# 0.20+ also carries the Autoscaling-project parameters (autoscaling_endpoint /
+# project / branch) that Lakebase instances of the newer generation need.
+databricks-langchain[memory]==0.20.0
+# 0.89+ for the Autoscaling-generation credential API the Lakebase pool calls.
+databricks-sdk==0.94.0
+databricks-agents==1.11.0
+# 3.x removed the shallow savers (unused here) and added the strict-msgpack
+# deserialization guard memory.py turns on.
+langgraph-checkpoint-postgres==3.1.1
+psycopg[binary]==3.3.4
+pydantic==2.12.5
+PyYAML==6.0.3

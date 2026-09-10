@@ -1,0 +1,22 @@
+                    LICENCE NOT YET SET — MUST BE COMPLETED BEFORE PUBLICATION
+
+    This placeholder exists so the omission is visible rather than silent.
+
+    A repository published with no licence grants the recipient no rights to
+    use, modify or redistribute the code. Legal must replace this file with the
+    licence text that applies to this delivery before the repository is pushed
+    or shared.
+
+    Replace the whole of this file. If the delivery is proprietary and
+    client-owned, the text is typically:
+
+        Copyright (c) 2026 <Legal entity name>. All rights reserved.
+
+        This software is provided to <Client> under the terms of the
+        engagement agreement between the parties. No licence is granted to
+        any other party.
+
+    If it is to be shared more widely, use the full, unmodified text of the
+    chosen licence (Apache-2.0 and MIT are the usual choices; Apache-2.0 adds
+    an explicit patent grant) from https://spdx.org/licenses/ and add the
+    matching `license` field to pyproject.toml.

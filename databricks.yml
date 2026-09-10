@@ -1,0 +1,307 @@
+# Databricks Asset Bundle for the Supervisor Agent.
+#
+# What the bundle owns declaratively:
+#
+#   * the Unity Catalog schema everything else lives in
+#   * a job that registers the prompts, seeds the governed configuration, and
+#     then logs, registers and deploys the agent
+#
+# What it does NOT own: the serving endpoint. `databricks.agents.deploy()`
+# creates that imperatively, together with the auth passthrough that grants the
+# endpoint's service principal access to the declared MLflow resources. Building
+# it as a `model_serving_endpoints` resource instead would lose that passthrough,
+# so the endpoint stays imperative and `bundle destroy` will not remove it.
+# `scripts/teardown_databricks.py` does — run it before `bundle destroy`.
+#
+#   databricks bundle validate -t dev
+#   databricks bundle deploy   -t dev
+#   databricks bundle run supervisor_agent_deploy -t dev
+#
+# Full prerequisites and step order: DEPLOYMENT.md
+
+bundle:
+  name: langgraph-supervisor
+
+# ── One deployment per environment, sharing nothing ─────────────────────────
+#
+# Every target gets its own Unity Catalog schema and its own Lakebase Postgres
+# schema, both named after the target. That is what makes `dev` a real
+# deployment rather than a rehearsal against prod's tables:
+#
+#                       dev                        prod
+#   UC schema           workspace.supervisor_dev   workspace.supervisor_prod
+#   registered model    …supervisor_dev.supervisor_agent
+#   serving endpoint    agents_workspace-supervisor_dev-supervisor_agent
+#   prompt alias        @dev                       @prod
+#   Lakebase schema     supervisor_dev             supervisor_prod
+#   ENVIRONMENT         dev                        prod
+#   routing model       sonnet                     opus
+#   workers             simulated                  live
+#
+# The serving endpoint name is derived from the registered model's full name, so
+# separating the schema separates the endpoint too — deploying dev cannot
+# overwrite the prod endpoint, and a caller has to name which one it wants.
+#
+# `dev` is a *deployed* environment and is held to the full runtime contract:
+# durable Lakebase state or refuse to boot, no safety-critical setting
+# disabled, every turn under a time budget. `ENVIRONMENT=local` is the only
+# value that relaxes any of that, and nothing here ever sets it — see
+# src/supervisor/settings.py.
+
+variables:
+  catalog:
+    description: Unity Catalog catalog holding the schema below.
+    default: workspace
+  schema:
+    description: >-
+      Schema for the model, the prompts and the governed configuration. One per
+      target, so a deploy to dev cannot touch prod's registered model or its
+      endpoint. Override with --var schema= only to run a second isolated copy
+      of one environment (two developers in one workspace, say).
+    default: supervisor_${bundle.target}
+  model_name:
+    description: Registered model name, unqualified.
+    default: supervisor_agent
+  experiment:
+    description: >-
+      MLflow experiment holding this environment's runs and traces. One per
+      target: dev traffic and prod traffic in a single experiment makes every
+      trace query, latency figure and evaluation run ambiguous.
+    default: /Shared/supervisor-agent-${bundle.target}
+  routing_llm_endpoint:
+    description: >-
+      Model Serving endpoint of the routing LLM — used for guardrail verdicts
+      and context resolution. Must exist in the workspace and be on the
+      approved model list.
+    default: databricks-claude-sonnet-4-5
+  audit_warehouse_id:
+    description: >-
+      SQL warehouse that creates and writes the optional Delta audit table.
+      Leave empty to skip that table entirely. The Postgres sink on Lakebase is
+      the primary decision-trail store and is unaffected by this setting; set a
+      warehouse id only if a Delta copy is also required.
+    default: ""
+  workers:
+    description: >-
+      'simulated' stands in for worker agents that are not deployed yet;
+      'live' declares their endpoints as resources and calls them for real.
+      Keep this 'simulated' until the worker endpoints actually exist —
+      declaring a resource that does not exist fails the model registration.
+    default: simulated
+  multi_model_enabled:
+    description: >-
+      'true' lets each agent registry entry select its own serving endpoint for
+      that agent's governance calls (screen, context resolution, simulation)
+      via an optional `model` field, with routing_llm_endpoint as the default
+      for entries that declare none. The supporting code is integrated but the
+      feature ships disabled. Enabling is configuration only: set 'true' here
+      and publish `model:` entries with scripts/publish_config.py.
+    default: "false"
+  lakebase_instance:
+    description: >-
+      Lakebase database instance backing durable conversation memory, long-term
+      memory, the governed configuration table, the review queue and the
+      Postgres audit sink. Required for conversation continuity, workflow
+      resumption and human approval. Leave empty only to run on the in-memory
+      fallbacks, where state does not survive a replica restart.
+      Create the instance first with scripts/provision_lakebase.py; declaring
+      one that does not exist fails the model registration.
+
+      One instance serves every environment by default — they are separated by
+      lakebase_schema below, which costs nothing. Point a target at its own
+      instance instead when the environments need physically separate
+      databases.
+    default: supervisor-memory
+  lakebase_schema:
+    description: >-
+      Postgres schema inside the instance that this environment owns.
+      Checkpoints, long-term memory, the governed configuration table, the
+      review queue and the audit trail all land in it, so dev and prod share an
+      instance without sharing a single row.
+
+      Create it before the first deploy —
+      `scripts/provision_lakebase.py --pg-schema <name> --grant-identity <sp>`.
+      Postgres accepts a search_path naming a schema that does not exist, and an
+      unqualified CREATE TABLE then falls through to `public`: the deploy would
+      succeed and quietly merge the two environments.
+
+      Empty means `public`, the single-environment shape.
+    default: supervisor_${bundle.target}
+
+# What the job needs, named explicitly so it is uploaded even if a future
+# .gitignore rule would have excluded it. `include` ADDS to the sync set; it
+# does not restrict it.
+sync:
+  include:
+    - src/**
+    - deploy/**
+    - scripts/**
+    - requirements.txt
+
+resources:
+  schemas:
+    supervisor_schema:
+      catalog_name: ${var.catalog}
+      name: ${var.schema}
+      comment: Supervisor Agent — model, prompts, governed configuration.
+
+  jobs:
+    supervisor_agent_deploy:
+      name: supervisor-agent-deploy
+      # The schema must exist before the prompts or the model land in it.
+      # `depends_on` orders the tasks; the bundle creates the schema at deploy
+      # time, before the job is ever run.
+      #
+      # The paths below are built from ${var.catalog}/${var.schema}, the same
+      # variables the schema resource uses, so the two always agree. Referencing
+      # `${resources.schemas.…}` would be tighter but those references are not
+      # interpolated into task parameters — they arrive at the job as literal
+      # text.
+      tasks:
+        - task_key: register_prompts
+          environment_key: default
+          spark_python_task:
+            python_file: scripts/register_prompts.py
+            parameters:
+              - "--catalog-schema"
+              - "${var.catalog}.${var.schema}"
+              - "--alias"
+              - "${bundle.target}"
+
+        # Seeds the governed configuration table from the bundled YAML, so a
+        # fresh workspace has agents/rbac/guardrails published before the
+        # endpoint first serves. Idempotent: a document identical to the active
+        # version is skipped, so redeploying does not manufacture a version per
+        # deploy. After this, a configuration change is `scripts/publish_config.py
+        # --apply` on its own — no bundle deploy.
+        - task_key: publish_config
+          environment_key: default
+          spark_python_task:
+            python_file: scripts/publish_config.py
+            parameters:
+              - "--apply"
+              - "--lakebase-instance"
+              - "${var.lakebase_instance}"
+              - "--lakebase-schema"
+              - "${var.lakebase_schema}"
+              - "-m"
+              - "seeded by supervisor-agent-deploy (${bundle.target})"
+
+        - task_key: log_and_deploy
+          depends_on:
+            - task_key: register_prompts
+            - task_key: publish_config
+          environment_key: default
+          spark_python_task:
+            python_file: deploy/log_and_deploy.py
+            parameters:
+              - "--uc-model"
+              - "${var.catalog}.${var.schema}.${var.model_name}"
+              - "--experiment"
+              - "${var.experiment}"
+              - "--routing-endpoint"
+              - "${var.routing_llm_endpoint}"
+              - "--environment"
+              - "${bundle.target}"
+              - "--prompt-catalog-schema"
+              - "${var.catalog}.${var.schema}"
+              - "--prompt-alias"
+              - "${bundle.target}"
+              - "--audit-warehouse-id"
+              - "${var.audit_warehouse_id}"
+              - "--audit-table"
+              - "${var.catalog}.${var.schema}.audit_log"
+              - "--workers"
+              - "${var.workers}"
+              - "--lakebase-instance"
+              - "${var.lakebase_instance}"
+              - "--lakebase-schema"
+              - "${var.lakebase_schema}"
+              - "--multi-model"
+              - "${var.multi_model_enabled}"
+
+      environments:
+        - environment_key: default
+          spec:
+            client: "2"
+            dependencies:
+              - -r requirements.txt
+
+    # On-demand backfill of the decision trail into governed Delta tables:
+    # Lakebase audit rows -> {catalog}.{schema}.audit_log, MLflow traces ->
+    # {catalog}.{schema}.mlflow_traces.
+    #
+    # Deliberately UNSCHEDULED. The steady-state path is the Databricks-managed
+    # trace archival job feeding {catalog}.{schema}.traces_archive (enabled with
+    # mlflow.tracing.archival.enable_databricks_trace_archival, per experiment)
+    # plus the audit_log_live view projected over it — no mirroring of ours.
+    # Run this job by hand only to backfill or cross-check:
+    #   databricks bundle run supervisor_delta_export -t dev
+    supervisor_delta_export:
+      name: supervisor-delta-export
+      tasks:
+        - task_key: export
+          environment_key: default
+          spark_python_task:
+            python_file: scripts/export_delta_mirror.py
+            parameters:
+              - "--lakebase-instance"
+              - "${var.lakebase_instance}"
+              - "--lakebase-schema"
+              - "${var.lakebase_schema}"
+              - "--audit-delta-table"
+              - "${var.catalog}.${var.schema}.audit_log"
+              - "--traces-delta-table"
+              - "${var.catalog}.${var.schema}.mlflow_traces"
+              - "--experiment"
+              - "${var.experiment}"
+      environments:
+        - environment_key: default
+          spec:
+            client: "2"
+            dependencies:
+              - -r requirements.txt
+
+targets:
+  # A deployed environment on Databricks, with its own UC schema, its own
+  # Lakebase schema, its own endpoint and its own prompts. Not a local mode:
+  # ENVIRONMENT=dev is deployed, so the endpoint refuses to boot without durable
+  # state exactly as prod does. The cheap model tier and the simulated workers
+  # are the only things that make it "dev".
+  dev:
+    default: true
+    # Deliberately NOT `mode: development`.
+    #
+    # Development mode prefixes resource names with the developer's username,
+    # and for a UC schema that prefix is not suppressible with
+    # `presets.name_prefix` — it would create `workspace.dev_<user>_supervisor_dev`.
+    # The serving endpoint name is derived from the model's full name, so a
+    # prefixed schema silently renames the endpoint and anything resolving it by
+    # name stops finding it. Deterministic names, at the cost of dev-mode
+    # isolation. Two developers sharing one workspace pass separate
+    # `--var schema=` and `--var lakebase_schema=` values instead.
+    variables:
+      routing_llm_endpoint: databricks-claude-sonnet-4-5
+      workers: simulated
+
+  prod:
+    mode: production
+    workspace:
+      # Set this before deploying to prod. Production mode refuses to run
+      # against whatever profile happens to be active.
+      host: https://<your-prod-workspace>.cloud.databricks.com
+      root_path: /Shared/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      # Strongest approved model for live governance decisions.
+      routing_llm_endpoint: databricks-claude-opus-4-5
+      # Prod expects the real worker endpoints to exist.
+      workers: live
+      # Schema separation (supervisor_prod, from the default above) is enough to
+      # keep dev and prod from sharing a row. Set a dedicated instance here
+      # instead when prod needs its own database — a separate failure domain,
+      # separate capacity, and a dev operator with instance-level access to
+      # nothing of prod's:
+      #   lakebase_instance: supervisor-memory-prod
+      # Create it first, and grant the prod endpoint's service principal on it:
+      #   scripts/provision_lakebase.py --instance supervisor-memory-prod \
+      #       --pg-schema supervisor_prod --grant-identity <prod-endpoint-sp>

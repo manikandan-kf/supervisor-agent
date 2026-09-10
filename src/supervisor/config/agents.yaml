@@ -1,0 +1,103 @@
+# Worker agent registry.
+# Onboarding a new agent = adding an entry here — no supervisor code change.
+#
+# id               stable identifier the Governance Front Door sends as agent_id
+# endpoint         the worker's Databricks Model Serving endpoint name
+# domain_scope     what the semantic screen judges queries against, per agent
+# required_context context keys route/clarify must resolve before dispatch
+# deny_patterns    extra per-agent tier-1 regex blocks (optional)
+# model            (optional) serving endpoint for THIS agent's
+#                  governance calls — semantic screen, context resolution,
+#                  worker simulation — e.g. a cheaper model for a simple
+#                  domain. Omitted = the global ROUTING_LLM_ENDPOINT. Honoured
+#                  only when MULTI_MODEL_ENABLED=true on the supervisor
+#                  endpoint; until then a declared value is ignored (logged
+#                  once). Never the worker's own internal model (ASM-03) —
+#                  `endpoint` is still where the dispatch goes.
+#
+# approval_patterns  requests to THIS agent matching one of these have their
+#                  response staged for human sign-off, whether or not the worker
+#                  asks for a gate. `{pattern, reason}` — the reason is shown to
+#                  the approver. Solution §04 puts "irreversible actions
+#                  (deployment steps) behind the human-in-the-loop approval
+#                  gate"; before this the gate opened only when a worker
+#                  volunteered custom_outputs.hitl, so the promise rested on
+#                  worker cooperation.
+# risk_level       low | medium | high | critical. Classification only —
+#                  recorded in the decision trail and shown to the approver.
+#                  Nothing is gated by the label; what gates is
+#                  approval_patterns, which is explicit.
+#
+# Not here, deliberately:
+#   supports_hitl / stages — a worker returning
+#   custom_outputs.hitl.status == "pending_approval" still opens a gate whether
+#   declared or not, and the supervisor never sequences a worker's stages.
+#   Listing them here implied an enforcement that does not exist. The staged
+#   order a UI displays is that UI's own concern.
+
+agents:
+  - id: requirement-agent
+    name: Requirement Agent
+    endpoint: requirement-agent
+    description: >-
+      Generates and refines software requirements: high-level design (HLD),
+      low-level design (LLD), epics, user stories and acceptance criteria.
+    domain_scope: >-
+      Software requirements engineering — business requirements, HLD, LLD,
+      epics, user stories, acceptance criteria, requirement traceability and
+      refinement.
+    required_context: [product_line]
+
+  - id: test-case-agent
+    name: Test Case Agent
+    endpoint: test-case-agent
+    description: >-
+      Generates functional test cases and test plans from documented
+      requirements.
+    domain_scope: >-
+      Functional and acceptance testing — test case generation, test plans, test
+      data, regression suites and coverage analysis for documented requirements.
+      Owns black-box testing of behaviour against requirements, including
+      anything asked for as "test cases" or a "test plan". Excludes unit tests
+      written alongside implementation code, which belong to the Coding Agent.
+    required_context: [product_line]
+
+  - id: coding-agent
+    name: Coding Agent
+    endpoint: coding-agent
+    description: >-
+      Assists with implementation: code generation, code review, refactoring
+      and unit tests.
+    domain_scope: >-
+      Software implementation — code generation, code review, refactoring and
+      debugging within the client's approved technology stack, including the
+      unit tests written alongside that code. Excludes functional or acceptance
+      test suites and test plans written against requirements, which belong to
+      the Test Case Agent.
+    required_context: []
+
+  - id: deployment-agent
+    name: Deployment Agent
+    endpoint: deployment-agent
+    description: >-
+      Assists with CI/CD, release and deployment activities.
+    domain_scope: >-
+      Deployment and release engineering — CI/CD pipelines, environment
+      promotion, release checklists and rollback procedures.
+    required_context: [environment]
+    risk_level: high
+    # The one agent whose remit includes irreversible acts. Each pattern names
+    # an *action against a named live environment*, never its subject: "what is
+    # the rollback procedure" and "document our release checklist" are
+    # informational and must not queue for a human, while "roll back prod" and
+    # "promote to production" must. That is why every pattern requires a
+    # production/live word within a short distance of the verb — a rule broad
+    # enough to catch the topic would gate the whole agent, and a gate on every
+    # answer trains reviewers to approve without reading.
+    approval_patterns:
+      - pattern: "(?i)\\b(deploy|promote|release|ship|cut\\s+a\\s+release)\\b[\\s\\S]{0,40}\\b(prod|production|live|customer[- ]facing)\\b"
+        reason: the request asks for a deployment or release to a production environment
+      - pattern: "(?i)\\b(roll\\s?back|revert|redeploy|hotfix)\\b[\\s\\S]{0,40}\\b(prod|production|live)\\b"
+        reason: the request asks to change what is currently running in production
+      - pattern: "(?i)\\b(drop|delete|truncate|destroy|tear\\s?down|decommission)\\b[\\s\\S]{0,40}\\b(database|table|cluster|namespace|environment|volume|bucket)\\b"
+        reason: the request asks for a destructive change to infrastructure or data

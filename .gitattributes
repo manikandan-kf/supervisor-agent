@@ -1,0 +1,15 @@
+# One line ending in the repository, whatever the contributor's OS.
+#
+# Without this, files committed from Windows arrive with CRLF and files
+# committed from macOS or Linux arrive with LF, so the first clone on the other
+# platform shows a whole-file diff on every one of them and `git blame` stops
+# being useful. Normalising in the repository and checking out natively is
+# git's documented answer.
+* text=auto eol=lf
+
+# Binary-ish: never normalise, never diff as text.
+*.png binary
+*.jpg binary
+*.pdf binary
+*.docx binary
+*.xlsx binary

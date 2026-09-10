@@ -1,0 +1,12 @@
+# Developer tooling. Not installed into the serving container — the deploy job
+# installs requirements.txt only.
+#
+# Equivalent to `pip install -e ".[dev]"`; kept as a file so CI can install the
+# runtime and the tooling in one step without building the package first.
+
+# Lint + security ruleset (see [tool.ruff] in pyproject.toml).
+ruff==0.14.6
+
+# The test suite in tests/. Everything there runs offline — no workspace, no
+# network, no database — so `pytest` needs nothing configured first.
+pytest==9.1.1

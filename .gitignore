@@ -1,0 +1,26 @@
+# Secrets — never commit. Copy .env.example to .env and fill it in locally.
+.env
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# MLflow local artefacts. MLflow 3.x defaults its tracking URI to
+# sqlite:///<cwd>/mlflow.db, so this regenerates on any local MLflow call.
+mlruns/
+mlartifacts/
+mlflow.db
+
+# Databricks CLI bundle state — per-workspace, regenerated on deploy. A stale
+# copy makes the CLI believe files are already uploaded when a new workspace has
+# never seen them.
+.databricks/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

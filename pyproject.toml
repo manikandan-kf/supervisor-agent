@@ -1,0 +1,142 @@
+# Project metadata, dependencies and tool configuration — PEP 621.
+#
+#     pip install -e ".[dev]"    # the package plus ruff and pytest
+#     ruff check .               # lint + the security ruleset
+#     pytest                     # the governance contract, offline
+#
+# Two things this file deliberately does NOT own:
+#
+#   * **What the serving container installs.** That is `requirements.txt`, which
+#     `deploy/log_and_deploy.py` passes to `mlflow.pyfunc.log_model(
+#     pip_requirements=...)` and which `databricks.yml` names. MLflow bakes that
+#     file into the model artifact, so it is the runtime contract; the
+#     `dependencies` below mirror it for local development and CI and must be
+#     kept in step with it. They are pinned identically for that reason.
+#   * **The deployed version.** A deployment is identified by its Unity Catalog
+#     registered-model version, assigned at deploy time. `version` below
+#     identifies the *source*, which is what a checkout can answer.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "supervisor-agent"
+description = "Governed LangGraph supervisor agent, served as an MLflow ResponsesAgent on Databricks Model Serving."
+readme = "README.md"
+# 3.11 is the floor DEPLOYMENT.md names as a prerequisite and the version CI
+# tests against — the lowest supported interpreter is the one worth proving.
+# No upper bound: capping `requires-python` blocks installation on a newer
+# interpreter that has not been shown to break anything, and this project runs
+# on 3.12 in development today. Raise the floor when the serving image does.
+requires-python = ">=3.11"
+dynamic = ["version"]
+
+# Mirrors requirements.txt exactly. See the note at the top of this file for
+# which of the two is authoritative for the serving container.
+dependencies = [
+    "mlflow==3.15.1",
+    "langgraph==1.2.11",
+    "langchain-core==1.5.3",
+    "langchain==1.2.10",
+    "databricks-langchain[memory]==0.20.0",
+    "databricks-sdk==0.94.0",
+    "databricks-agents==1.11.0",
+    "langgraph-checkpoint-postgres==3.1.1",
+    "psycopg[binary]==3.3.4",
+    "pydantic==2.12.5",
+    "PyYAML==6.0.3",
+]
+
+[project.optional-dependencies]
+# Developer tooling. Never installed into the serving container — the deploy job
+# installs requirements.txt only.
+dev = [
+    "ruff==0.14.6",
+    "pytest==9.1.1",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "supervisor.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ── pytest ───────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# No `addopts`: a bare `pytest` and the `pytest -q --junitxml=…` CI runs behave
+# identically, so what CI reports is what a developer sees.
+
+# ── ruff: lint and the security ruleset ──────────────────────────────────────
+#
+#     ruff check .              # lint + the security ruleset
+#     ruff check --select S .   # security findings only
+#
+# The `S` ruleset is a port of flake8-bandit, so this covers the SAST pass and
+# general linting with one tool. `ruff check .` runs in CI, which is what turns
+# it from a linter someone runs into a pipeline-scan evidence artifact.
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = [".venv", ".databricks", "mlruns"]
+
+[tool.ruff.lint]
+# `E`/`F` are the pyflakes+pycodestyle baseline; `S` is the security ruleset
+# (flake8-bandit); `B` catches the bug-shaped patterns most worth having in a
+# governance layer (mutable defaults, `except` ordering, unused loop bindings);
+# `I` keeps import order deterministic, so a diff shows a change rather than a
+# reshuffle.
+select = ["E", "F", "S", "B", "I"]
+
+ignore = [
+    # Long lines. This codebase carries explanatory prose in docstrings and
+    # comments deliberately, and reflowing it to a column limit would cost more
+    # than it returns.
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# ── S608: SQL built by interpolating a table name ────────────────────────────
+# SQL cannot parameterize an *identifier*, so a table name has to reach the
+# statement as text. Every value in these statements is bound with `%s` and
+# parameterized by psycopg; only the identifier is interpolated.
+#
+# The suppression rests on an enforced property, not on trust:
+# `config_store.safe_identifier()` validates the name against
+# `^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*){0,2}$` at construction, so
+# nothing carrying a quote, a semicolon, whitespace or a comment marker can
+# reach these strings. Each sink validates in `__init__`, once, rather than at
+# every statement.
+"src/supervisor/config_store.py" = ["S608"]
+"src/supervisor/audit.py" = ["S608"]
+"src/supervisor/review_queue.py" = ["S608"]
+
+# Operator-run scripts against a database the operator already has credentials
+# for, with table names supplied as command-line arguments by that same
+# operator. There is no untrusted input path into these.
+"scripts/verify_deployment.py" = ["S608"]
+"scripts/export_delta_mirror.py" = ["S608"]
+"scripts/inspect_lakebase.py" = ["S608"]
+
+# ── S101 / S105 / S106: asserts and literal secrets, in tests only ───────────
+# `assert` is how a test states its expectation; the rule exists to stop asserts
+# carrying a runtime guarantee, which is a `src/` concern. The two hardcoded-
+# password rules fire on the obviously-synthetic values a test needs in order to
+# prove redaction and signature checking work at all — a redaction test cannot
+# demonstrate anything without a token-shaped string to redact.
+#
+# Scoped to `tests/*` deliberately: no `src/` file is exempt from any of the
+# three, so the rules keep doing their job everywhere they still apply.
+"tests/*" = ["S101", "S105", "S106"]
+
+# ── S110 / S112: quiet except ────────────────────────────────────────────────
+# Best-effort paths in operator scripts where the failure genuinely does not
+# matter and there is nowhere useful to report it — a missing `.env`, or one
+# unreadable prompt version while listing many. The equivalent in the request
+# path is logged at debug instead, because a silent failure there would hide a
+# real one.
+"scripts/publish_config.py" = ["S110"]
+"scripts/register_prompts.py" = ["S110"]
+"scripts/trace_turn.py" = ["S110"]
+"scripts/show_prompts.py" = ["S112"]

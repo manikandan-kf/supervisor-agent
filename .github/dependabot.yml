@@ -1,0 +1,36 @@
+# Dependency updates, opened as pull requests so they are reviewed rather than
+# absorbed.
+#
+# `requirements.txt` is pinned exactly and is baked into the served model, so a
+# bump here is a change to what production runs. That is the point: an update
+# that arrives as a reviewable PR with a changelog link is one somebody decided
+# to take. Silent floors were the alternative, and they are how a deploy changes
+# without a commit.
+#
+# Raising a pin means raising it in BOTH `requirements.txt` and
+# `pyproject.toml`. Dependabot opens a PR per file, so expect a pair; merge them
+# together and check the endpoint build log on the first dev deploy afterwards.
+
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
+    groups:
+      # One PR for the agent stack rather than five — these versions move
+      # together and are tested together.
+      agent-stack:
+        patterns:
+          - "langgraph*"
+          - "langchain*"
+          - "mlflow"
+          - "databricks-*"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    labels: ["dependencies"]

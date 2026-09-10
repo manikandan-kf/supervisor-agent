@@ -1,0 +1,27 @@
+# Review is required on every path here — set branch protection on `main` to
+# "require a pull request with at least one approving review" for this file to
+# have any effect.
+#
+# Replace the placeholders with the client's own team handles before the first
+# push; an unresolvable owner silently reviews nothing.
+
+# Everything, by default.
+*                               @<org>/<platform-team>
+
+# The governance surface. A change to any of these changes what the agent is
+# allowed to do, or what it can be shown to have done, so it deserves a named
+# reviewer rather than the default one.
+/src/supervisor/guardrails.py   @<org>/<security-team>
+/src/supervisor/output_guard.py @<org>/<security-team>
+/src/supervisor/sensitive.py    @<org>/<security-team>
+/src/supervisor/sanitize.py     @<org>/<security-team>
+/src/supervisor/rbac.py         @<org>/<security-team>
+/src/supervisor/trust.py        @<org>/<security-team>
+/src/supervisor/audit.py        @<org>/<security-team>
+/src/supervisor/config/         @<org>/<security-team>
+/SECURITY.md                    @<org>/<security-team>
+
+# The deployment path.
+/databricks.yml                 @<org>/<platform-team>
+/deploy/                        @<org>/<platform-team>
+/.github/workflows/             @<org>/<platform-team>
