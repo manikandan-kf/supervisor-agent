@@ -76,7 +76,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-from .sanitize import neutralise_history_text
+from agent_governance.sanitize import neutralise_history_text
 
 # Punctuation and conjunctions that separate the note from a trailing marker.
 _SEPARATOR = r"[\s,;:.–—-]*"

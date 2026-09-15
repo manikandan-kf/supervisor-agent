@@ -13,15 +13,21 @@ report involves real data, describe the shape rather than pasting the values.
 
 ## What is in scope
 
-This repository is the **supervisor agent** only — the governance layer between
-a caller and the worker agents. In scope:
+This repository holds the **supervisor agent** — the governance layer between a
+caller and the worker agents — and the **shared governance library**
+(`libs/agent_governance`) that every agent on the platform installs. A finding
+in the library affects every consumer, so it is the higher-priority report. In
+scope:
 
 - the guardrail layers: input screening, prompt handling, memory writes,
   retrieval and worker relay, runtime bounds, and the output screen
-- authorization: the RBAC gate, entitlement signing, and the invocation surface
+- authorization: the RBAC gate, entitlement and dispatch signing, and the
+  invocation surface
 - the decision trail: the audit sink, its hash chain, and what reaches it
 - the governed configuration path: what a published document can change, and
   what it cannot
+- the library's packaging path: what ends up in the wheel and in the model
+  artifact
 - dependency and supply-chain issues in the pinned set in `requirements.txt`
 
 Out of scope, because they are separate deployables owned elsewhere: the calling
@@ -32,7 +38,8 @@ agents' own behaviour within their remit.
 
 The `main` branch and the currently deployed Unity Catalog registered-model
 version. Fixes are delivered as a new model version through the normal deploy
-path in `DEPLOYMENT.md`; there is no long-term support branch.
+path in `DEPLOYMENT.md`; a library fix is also a new wheel version on the
+platform volume. There is no long-term support branch.
 
 ## Security-relevant design decisions
 

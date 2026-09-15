@@ -12,7 +12,7 @@ Two rows of that table are covered here:
 
 from __future__ import annotations
 
-from conftest import StubGuardrails, invoke
+from helpers import StubGuardrails, invoke
 
 from supervisor.guardrails import GuardrailResult
 from supervisor.nodes import (

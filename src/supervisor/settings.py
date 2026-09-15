@@ -7,107 +7,31 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent_governance.environment import (  # noqa: F401 — re-exported for the package
+    catalog,
+    is_local_environment,
+    resource_environment,
+)
+from agent_governance.environment import environment_schema as _environment_schema
+
 logger = logging.getLogger(__name__)
 
 _PACKAGE_CONFIG = Path(__file__).resolve().parent / "config"
 
-# ── Where this process is running, and what that permits ────────────────────
-#
-# `ENVIRONMENT` answers two different questions, and conflating them is a bug:
-#
-#   1. *Which* deployment is this? Selects the prompt alias, the Unity Catalog
-#      schema, the Lakebase schema and the routing model tier. Every deployed
-#      environment has its own — `dev` and `prod` share no state.
-#   2. *May a control degrade here?* Only on a workstation or in CI.
-#
-# A dev deployment is a deployment: it has a real store, real durability and the
-# same failsafe doctrine as prod — it just costs less and points at a cheaper
-# model. Treating `dev` as "somewhere controls may lapse" would put the
-# exemption in the one environment whose behaviour is supposed to predict
-# prod's, and a dev endpoint that silently fell back to in-memory state would
-# look healthy while losing every conversation on restart.
-#
-# So the degradation set is the *local* one, and `dev` is not in it. Running on
-# a workstation is `ENVIRONMENT=local` (see `.env.example`); a test runner
-# leaves the variable unset, which is the empty string below.
-_LOCAL_ENVIRONMENTS = frozenset({"local", "test", "testing", ""})
-
-
-def is_local_environment(environment: str | None = None) -> bool:
-    """Whether this process runs somewhere a weakened control is acceptable.
-
-    True only off Databricks — a workstation or a CI runner. Every deployed
-    environment, `dev` included, answers False and is held to the full contract:
-    refuse to boot without a durable store, refuse to serve with a
-    safety-critical setting disabled, never run a turn without a time budget.
-    """
-    env = environment if environment is not None else os.getenv("ENVIRONMENT", "local")
-    return (env or "").strip().lower() in _LOCAL_ENVIRONMENTS
-
-
-# ── One knob: every per-environment name derives from ENVIRONMENT ───────────
-#
-# The naming convention itself lives in `scripts/_environment.py`, which the
-# operator scripts and the bundle already share. These three functions are the
-# same convention applied inside the process, so that switching environment is
-# one value here too — not four that can silently disagree.
-#
-# What went wrong without this: the runtime read `PROMPT_ALIAS`,
-# `PROMPT_CATALOG_SCHEMA` and `LAKEBASE_SCHEMA` as independent variables whose
-# defaults predated the dev/prod split. Setting `ENVIRONMENT=prod` alone gave
-# alias `prod`, prompts from `workspace.supervisor` (a schema that no longer
-# exists) and Postgres schema `public` (the schema *both* environments used
-# before the split). Every combination was reachable, and a wrong one fails the
-# way this whole area fails — silently, by writing to the other environment.
-#
-# The deployed endpoint was never exposed to it, because `databricks.yml` stamps
-# all three explicitly. `.env` and any non-bundle host were.
-_DEFAULT_CATALOG = "workspace"
+# `ENVIRONMENT` answers two questions — which deployment's resources to use,
+# and whether a control may degrade — and the shared library owns both answers
+# (`agent_governance.environment`). What is the supervisor's alone is the
+# prefix of its per-environment schema.
 _SCHEMA_PREFIX = "supervisor"
-
-# Which deployed environment a *workstation* run addresses. A local process has
-# no resources of its own — there is no `supervisor_local` schema and no `@local`
-# prompt alias — so it has to borrow a deployed environment's, and dev is the one
-# `.env.example` has always pointed at.
-#
-# Deliberately a constant rather than another variable. Pointing a lenient
-# process at prod's tables is exactly the combination worth making awkward: it is
-# still reachable by setting the names explicitly below, which is a deliberate
-# act rather than a one-word edit.
-_LOCAL_READS = "dev"
-
-
-def resource_environment(environment: str | None = None) -> str:
-    """Which deployed environment's resources this process addresses.
-
-    The other half of `is_local_environment`. That one answers "may a control
-    degrade here?"; this one answers "whose prompts, schema and tables?". One
-    variable still decides both, which is what makes it a single knob — the two
-    questions have different answers for `local`, not different inputs.
-    """
-    env = environment if environment is not None else os.getenv("ENVIRONMENT", "local")
-    env = (env or "").strip().lower()
-    return _LOCAL_READS if env in _LOCAL_ENVIRONMENTS else env
-
-
-def catalog() -> str:
-    """The Unity Catalog catalog holding this project's schemas.
-
-    One catalog with a schema per environment is the shape here; Databricks
-    documents a catalog per environment, which is a rename of this value plus a
-    schema that no longer carries the environment. `SUPERVISOR_CATALOG` is the
-    seam for that migration, and matches `scripts/_environment.py`.
-    """
-    return os.getenv("SUPERVISOR_CATALOG", _DEFAULT_CATALOG).strip() or _DEFAULT_CATALOG
 
 
 def environment_schema(environment: str | None = None) -> str:
-    """`supervisor_dev`, `supervisor_prod`, … — the per-environment schema name.
+    """`supervisor_dev`, `supervisor_prod`, … — this agent's per-environment schema.
 
-    Used unqualified as the Lakebase Postgres schema, and qualified with the
-    catalog as the Unity Catalog schema. One name, so the two cannot drift.
+    Used unqualified as the Lakebase Postgres schema and qualified with the
+    catalog as the Unity Catalog schema, so the two cannot drift.
     """
-    return f"{_SCHEMA_PREFIX}_{resource_environment(environment)}"
+    return _environment_schema(_SCHEMA_PREFIX, environment)
 
 
 @dataclass(frozen=True)
@@ -116,11 +40,6 @@ class Settings:
     # a medium-tier endpoint, prod a high-tier one — wired via DAB target vars.
     routing_llm_endpoint: str = field(
         default_factory=lambda: os.getenv("ROUTING_LLM_ENDPOINT", "databricks-claude-sonnet-4-5")
-    )
-    # Provider is configuration, not code — see model_provider.py. Anything
-    # `init_chat_model` understands: databricks, anthropic, openai, ollama, …
-    routing_llm_provider: str = field(
-        default_factory=lambda: os.getenv("ROUTING_LLM_PROVIDER", "databricks")
     )
     # Governance decisions should be reproducible, so the routing model runs
     # near-deterministic unless deliberately overridden.
@@ -294,8 +213,11 @@ class Settings:
     )
 
     # ── Thread execution serialization (§4.4) ───────────────────────────────
-    # "Only one execution updates a thread at a time." See locking.py for the
-    # mechanism and for exactly where it degrades.
+    # "Only one execution updates a thread at a time." Model Serving does not
+    # do this for us — several replicas, several worker processes, no affinity
+    # by conversation — so `agent.py` takes `agent_governance.locking`'s
+    # advisory lock around every graph run. See that module for where it
+    # degrades.
     thread_lock_enabled: bool = field(
         default_factory=lambda: os.getenv("THREAD_LOCK_ENABLED", "true").lower() != "false"
     )
@@ -310,33 +232,11 @@ class Settings:
     )
 
     # ── Audit sink ──────────────────────────────────────────────────────────
-    # Preference order, highest first:
-    #
-    #   1. Postgres  — when a DSN resolves. One INSERT on the connection the
-    #      checkpointer already holds. No extra entitlement, no warehouse to
-    #      start, and it works from inside Model Serving.
-    #   2. SQL warehouse — the Statement Execution API against a UC Delta
-    #      table. Needs the endpoint's service principal to hold the
-    #      `databricks-sql-access` entitlement, which is exactly what has been
-    #      failing: that identity does not appear in SCIM, so it cannot be
-    #      granted, and every INSERT is refused.
-    #   3. Process log — always available, never lost, but not queryable.
-    #
-    # BR-006 wants queryable telemetry, so 1 is the target and 2 is legacy.
-    audit_table: str = field(
-        default_factory=lambda: os.getenv("AUDIT_TABLE", "governance.supervisor.audit_log")
-    )
-    audit_warehouse_id: str = field(default_factory=lambda: os.getenv("AUDIT_WAREHOUSE_ID", ""))
-    # The SQL-warehouse sink cannot work from inside Model Serving — the
-    # endpoint's system service principal can never hold `databricks-sql-access`
-    # (the settled constraint documented above). Yet setting
-    # AUDIT_WAREHOUSE_ID is a plausible operator action, and before this guard
-    # it silently routed every audit write into a path where each one fails:
-    # governance turns held, answers unaudited. The dead path now needs an
-    # explicit "I know this is unsupported" flag as well as the warehouse id.
-    audit_allow_warehouse: bool = field(
-        default_factory=lambda: os.getenv("AUDIT_ALLOW_WAREHOUSE", "").lower() == "true"
-    )
+    # Postgres when a DSN or Lakebase instance resolves — one INSERT on the
+    # connection the checkpointer already holds, no extra entitlement, and it
+    # works from inside Model Serving. Otherwise the process log: never lost,
+    # but not queryable. There is no SQL-warehouse sink: the endpoint's system
+    # service principal can never hold `databricks-sql-access`.
     # Postgres table for the decision trail. Unqualified names land in the
     # connection's default schema.
     audit_pg_table: str = field(
@@ -400,6 +300,21 @@ class Settings:
     approval_max_age_seconds: float = field(
         default_factory=lambda: float(
             os.getenv("APPROVAL_MAX_AGE_SECONDS", str(30 * 24 * 3600))
+        )
+    )
+
+    # ── Long-term memory retention (guardrail layer 3) ──────────────────────
+    # How long a remembered `required_context` value keeps feeding later turns.
+    # Unlike a session, this survives the conversation that established it, so
+    # without a ceiling a product line answered once drives routing prompts
+    # indefinitely — including after the thing it named was reorganised away.
+    # Evaluated lazily on read (see `memory.LongTermMemory`). Zero or less keeps
+    # everything forever — a retention control switched off, so a deployed
+    # environment refuses to serve with it, exactly as it does for the session
+    # bound above.
+    long_term_memory_ttl_seconds: float = field(
+        default_factory=lambda: float(
+            os.getenv("LONG_TERM_MEMORY_TTL_SECONDS", str(90 * 24 * 3600))
         )
     )
 
@@ -629,6 +544,11 @@ class Settings:
                 "APPROVAL_MAX_AGE_SECONDS below SESSION_MAX_AGE_SECONDS expires a pending "
                 "approval sooner than an ordinary conversation"
             )
+        if self.long_term_memory_ttl_seconds <= 0:
+            findings.append(
+                "LONG_TERM_MEMORY_TTL_SECONDS<=0 keeps remembered context forever "
+                "(guardrail layer 3: memory expiry)"
+            )
         if self.worker_output_max_chars <= 0:
             findings.append("WORKER_OUTPUT_MAX_CHARS<=0 removes the worker output size bound")
         if self.input_max_chars <= 0:
@@ -690,13 +610,6 @@ class Settings:
             logger.error("settings: %s (tolerated only outside deployed environments)", finding)
 
     @property
-    def agents_config(self) -> Path:
-        return self.config_dir / "agents.yaml"
-
-    @property
-    def rbac_config(self) -> Path:
-        return self.config_dir / "rbac.yaml"
-
-    @property
     def guardrails_config(self) -> Path:
+        """The bundled guardrails seed — what the tier-1 pattern tests read."""
         return self.config_dir / "guardrails.yaml"

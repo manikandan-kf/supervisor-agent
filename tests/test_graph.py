@@ -1,11 +1,11 @@
 """End-to-end pipeline tests over the compiled graph with stub services."""
 
-from conftest import StubGuardrails, StubRouter, StubWorkers, invoke, resume
+from agent_governance.rbac import DENIED_MESSAGE
+from helpers import StubGuardrails, StubRouter, StubWorkers, invoke, resume
 
 from supervisor.dispatch import WorkerResponse
 from supervisor.guardrails import GuardrailResult
 from supervisor.nodes import ESCALATION_MESSAGE
-from supervisor.rbac import DENIED_MESSAGE
 from supervisor.routing import RouteResult
 
 

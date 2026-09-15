@@ -5,42 +5,40 @@ Everything this component needs **from** a Databricks workspace, everything it
 fresh workspace.
 
 The whole deployment is the Databricks Asset Bundle in this repository plus a
-short sequence of grants that the bundle cannot express.
+short sequence of grants that the bundle cannot express. Every step is a
+Databricks CLI command, a SQL statement, or one of the four scripts in
+`deploy/` that the bundle's job runs for you.
 
 **Run it once per environment.** `dev` and `prod` are two deployments that share
 nothing but the Lakebase instance, and every name below derives from the bundle
-target — `-t dev` and `-t prod` throughout, `-e dev` / `-e prod` for the operator
-scripts. §3 lists exactly what each one creates. A third environment is a new
-target in `databricks.yml` and no other change.
+target — `-t dev` and `-t prod` throughout. A third environment is a new target
+in `databricks.yml` and no other change.
 
 `dev` is a deployment, not a mode: it is held to the same runtime contract as
 prod — durable state or refuse to boot, no safety-critical setting disabled,
 every turn under a time budget. `ENVIRONMENT=local` is the only value that
-relaxes any of it, and only `.env.example` (a workstation file) uses it.
+relaxes any of it, and only a workstation uses it.
 
 ---
 
 ## 1. Prerequisites — what to have before you start
 
-Collect these first. Every one is a question for the workspace or account owner;
-none can be discovered by the code.
-
 | # | What | Why it is needed |
 |---|---|---|
 | 1 | **Workspace URL** and a user with admin (or near-admin) rights | CLI authentication, bundle deploy, creating the service principal, granting ACLs |
-| 2 | **Unity Catalog**: a catalog, and permission to create **one schema per environment** in it | Holds the registered model, the prompts and the governed configuration. Defaults to `workspace.supervisor_dev` and `workspace.supervisor_prod` |
+| 2 | **Unity Catalog**: a catalog, and permission to create **one schema per environment** plus one platform schema in it | Holds the registered model, the prompts, the governed configuration, and the volume the shared library is published to. Defaults to `workspace.supervisor_dev`, `workspace.supervisor_prod` and `workspace.agent_platform` |
 | 3 | **A foundation-model serving endpoint** on your approved model list, pay-per-token | The governance model used for guardrail verdicts and context resolution. Dev and prod may use different tiers |
 | 4 | **Lakebase (Databricks Postgres)** capability | Conversation checkpoints, long-term memory, the governed configuration table, the review queue and the audit sink. One instance serves every environment, separated by Postgres schema |
 | 5 | **Serverless jobs compute** | Runs the deploy job. Enabled by default on most workspaces |
 | 6 | **Model Serving** enabled | Hosts the agent |
 | 7 | **A service principal** (SCIM-visible) **with one generated secret** | The OAuth M2M identity your front door uses to call the agent endpoint |
-| 8 | *(Optional)* A **SQL warehouse id** | Only if you also want a Delta copy of the audit table. The Postgres sink is the primary store and needs no warehouse |
 
-**Deliberately not required:** the `databricks-sql-access` entitlement for the
-serving endpoint (its system service principal can never hold it — see §7b), and
-any external cloud storage or Unity Catalog external location.
+**Deliberately not required:** a SQL warehouse, the `databricks-sql-access`
+entitlement for the serving endpoint (its system service principal can never
+hold it), and any external cloud storage or Unity Catalog external location.
 
-Local tooling: the Databricks CLI (v1.10+), Python 3.11+, and a virtual
+Local tooling: the Databricks CLI (v1.10+), Python 3.11+ with `pip` (the bundle
+builds the shared library wheel locally with `pip wheel`), and a virtual
 environment with `pip install -r requirements.txt -r requirements-dev.txt`.
 
 ---
@@ -58,32 +56,32 @@ separate jobs.
 
 > The endpoint's own service principal does **not** appear in SCIM —
 > `databricks service-principals list` will not show it. The endpoint page in
-> the UI shows it; §7 gives a CLI route.
+> the UI shows it, and its first Lakebase connection creates a Postgres role
+> named after its application id (§7b).
 
 ---
 
 ## 3. What the deployment creates in the workspace
 
 **Everything here is per environment** — `<env>` is the bundle target — except
-the Lakebase instance, which is shared and separated by Postgres schema.
-Deploying one environment cannot touch another's objects.
+the Lakebase instance and the platform schema, which are shared.
 
 | Object | Name | Created by |
 |---|---|---|
 | Unity Catalog schema | `<catalog>.supervisor_<env>` | `bundle deploy` |
 | Job | `supervisor-agent-deploy` | `bundle deploy` |
+| Shared library wheel | `agent_governance-<version>-py3-none-any.whl` | `bundle deploy` (built locally, uploaded with the bundle) |
 | MLflow experiment | `/Shared/supervisor-agent-<env>` | the job |
-| Registered model | `<catalog>.supervisor_<env>.supervisor_agent` | the job |
-| Prompts (3) | `supervisor_domain_screen`, `supervisor_routing`, `supervisor_worker_simulation`, aliased `@<env>` | the job |
+| Prompts (3) | `supervisor_domain_screen`, `supervisor_routing`, `supervisor_worker_simulation`, aliased `@<env>` | the job (`register_prompts`) |
+| Registered model | `<catalog>.supervisor_<env>.supervisor_agent`, with the wheel under `wheels/` | the job (`log_and_deploy`) |
 | Serving endpoint | `agents_<catalog>-supervisor_<env>-supervisor_agent` | `agents.deploy()` inside the job |
+| Platform schema + volume | `<catalog>.agent_platform.libs` — **shared** by every agent | the job (`publish_library`) |
 | Lakebase instance | `supervisor-memory` — **shared** across environments | step 5 |
-| Postgres schema | `supervisor_<env>` | step 5 |
-| Postgres tables | checkpoints, store, `supervisor_config`, `supervisor_review_queue`, `supervisor_audit_log`, all inside that schema | created by the runtime on first use |
+| Postgres schema | `supervisor_<env>` | the runtime, on the first connection (`CREATE SCHEMA IF NOT EXISTS`) |
+| Postgres tables | checkpoints, store, `supervisor_config`, `supervisor_review_queue`, `supervisor_audit_log`, all inside that schema | the runtime, on first use |
 
-The endpoint name is derived from the model's full name — which is precisely how
-the per-environment schema gives each environment its own endpoint. Changing the
-catalog or schema renames the endpoint, so anything resolving it by name must
-change too.
+The endpoint name is derived from the model's full name — which is how the
+per-environment schema gives each environment its own endpoint.
 
 ---
 
@@ -116,10 +114,8 @@ databricks service-principals create --display-name "supervisor-platform-api" --
 databricks service-principal-secrets-proxy create <scim-id>
 ```
 
-The secret is shown **once**. Record it in your secret store; if it scrolls
-away, generate another rather than hunting for it — there is no read-back API.
-Put the application id and secret wherever your front door reads its
-credentials from.
+The secret is shown **once**. Record it in your secret store. Put the
+application id and secret wherever your front door reads its credentials from.
 
 Pre-flight, before going further:
 
@@ -137,42 +133,33 @@ in `src/` names a model.
 ## 5. Provision Lakebase
 
 The deploy job **fails** if the instance named in `databricks.yml` does not
-exist, so this runs first.
+exist, so this runs first. One instance serves every environment:
 
 ```
-# the instance — once per workspace, shared by every environment
-python scripts/provision_lakebase.py --instance supervisor-memory
-# creating instance 'supervisor-memory' (capacity CU_1)
-# state: UPDATING … AVAILABLE      (about two minutes)
-
-# this environment's schema — once per environment, before its first deploy
-python scripts/provision_lakebase.py --instance supervisor-memory \
-  --skip-instance --pg-schema supervisor_dev
-# schema 'supervisor_dev' exists
+databricks database create-database-instance supervisor-memory --capacity CU_1
+databricks database get-database-instance supervisor-memory      # repeat until state: AVAILABLE (~2 min)
 ```
 
-The schema is what separates dev's checkpoints, audit rows and governed
-configuration from prod's.
+**The environment's Postgres schema needs no separate step.** Every pool the
+runtime opens issues `CREATE SCHEMA IF NOT EXISTS <lakebase_schema>` first, and
+the `publish_config` task in §6 is the first thing to connect — running as
+you, the instance owner — so `supervisor_dev` exists before the endpoint ever
+boots. That closes the failure the schema step used to guard against: Postgres
+accepts a `search_path` naming a schema that does not exist and lets an
+unqualified `CREATE TABLE` fall through to `public`, quietly pooling two
+environments' rows in one table.
 
-> **Do not skip the second command.** Postgres accepts a `search_path` naming a
-> schema that does not exist, so an unqualified `CREATE TABLE` falls through to
-> `public`. A missing schema does not fail the deploy — it succeeds and quietly
-> puts both environments' rows in one set of tables, which is only visible once
-> someone reads a row that should not be there.
-
-Physical isolation instead of schema isolation is the same script with a
-different `--instance` per environment, plus `lakebase_instance` set on that
-target in `databricks.yml`.
+Physical isolation instead of schema isolation is a second instance plus
+`lakebase_instance` set on that target in `databricks.yml`.
 
 > **Cost:** Lakebase bills continuously for as long as the instance exists. It
 > is the first thing to remove in a non-permanent environment
-> (`databricks database delete-database-instance supervisor-memory`); the code
-> falls back to in-memory state without any change, losing durability.
+> (`databricks database delete-database-instance supervisor-memory`).
 
 If your workspace creates Autoscaling-generation instances (project/branch
-rather than a provisioned instance), use `LAKEBASE_AUTOSCALING_ENDPOINT` /
-`LAKEBASE_PROJECT` / `LAKEBASE_BRANCH` instead of `LAKEBASE_INSTANCE`. The
-script reports which generation it created.
+rather than a provisioned instance), set `LAKEBASE_AUTOSCALING_ENDPOINT` or
+`LAKEBASE_PROJECT` / `LAKEBASE_BRANCH` in the deploy shell instead of relying
+on `LAKEBASE_INSTANCE`; `log_and_deploy.py` passes them to the container.
 
 ---
 
@@ -180,30 +167,38 @@ script reports which generation it created.
 
 ```
 databricks bundle validate -t dev     # → Validation OK!
-databricks bundle deploy   -t dev     # uploads files, creates the UC schema and the job
+databricks bundle deploy   -t dev     # builds the library wheel, uploads files, creates the UC schema and the job
 databricks bundle run supervisor_agent_deploy -t dev
 ```
 
-Three tasks. `register_prompts` and `publish_config` run in parallel, then
-`log_and_deploy` once both succeed:
+`bundle deploy` runs `python -m pip wheel --no-deps --wheel-dir dist .` inside
+`libs/agent_governance` before uploading, so the machine running it needs
+Python and `pip` on the path.
+
+Four tasks. Three run in parallel, then `log_and_deploy` once the prompts and
+the configuration are in place:
 
 | Task | What it does |
 |---|---|
 | `register_prompts` | Registers the three prompts and points the target's alias at them |
-| `publish_config` | Seeds `supervisor_config` from `src/supervisor/config/*.yaml`, so the agent is governed before it first serves |
-| `log_and_deploy` | Logs the model, registers it in Unity Catalog, and deploys the serving endpoint |
+| `publish_config` | Seeds `supervisor_config` from `src/supervisor/config/*.yaml`, so the agent is governed before it first serves. Creates the environment's Postgres schema as a side effect |
+| `publish_library` | Copies the library wheel to `/Volumes/<catalog>/agent_platform/libs/` for the other agents. Skips a version already there |
+| `log_and_deploy` | Logs the model with the wheel baked in under `wheels/`, registers it in Unity Catalog, and deploys the serving endpoint |
 
 Expect **10–15 minutes**, almost all of it the serving-container build.
 `agents.deploy()` returns when the rollout is *initiated*, not when it is
 serving — so wait for it explicitly before verifying anything:
 
 ```
-python scripts/wait_for_endpoint.py -e dev --timeout 1800
+databricks serving-endpoints get agents_<catalog>-supervisor_<env>-supervisor_agent -o json
+# ready when:  .state.ready == "READY"  and  .state.config_update == "NOT_UPDATING"
 ```
 
-Repeat the whole step with `-t prod` / `-e prod` for the production
-environment — it creates its own schema, model, endpoint, prompts and
-experiment.
+`UPDATE_FAILED` is terminal — it never becomes `NOT_UPDATING`. The per-entity
+`deployment_state_message` in `pending_config.served_entities` carries the
+cause; the commonest is the account's served-entity cap.
+
+Repeat the whole step with `-t prod` for the production environment.
 
 > Several log lines from `log_and_deploy` look alarming and are expected: the
 > job validates the model with a test prediction that runs **without** the
@@ -213,8 +208,7 @@ experiment.
 
 > **Do not start a second deploy while a rollout is in progress.**
 > `agents.deploy()` refuses an updating endpoint with *"Endpoint … is currently
-> updating"* and strands the model version it just registered. Wait for
-> `wait_for_endpoint.py` to exit cleanly first.
+> updating"* and strands the model version it just registered.
 
 ---
 
@@ -222,17 +216,9 @@ experiment.
 
 Three grants, for three different identities. `agents.deploy()` recreates the
 endpoint with a default ACL, so **redo these after any teardown-and-rebuild.**
-
-All three are **per environment**, and each environment's endpoint has its own
-service principal. `--pg-schema` and `-e` are not optional once more than one
-environment exists: without them the commands resolve through `public` or
-through `dev`, and act on the wrong environment's tables — or on none, silently.
+All three are **per environment**.
 
 ### 7a. Caller SP → CAN QUERY on the endpoint
-
-Do this **before** running `wait_for_endpoint.py` if your `.env` carries the
-service principal's credentials: the scripts then authenticate as that SP, and
-an SP with no grants cannot even read the endpoint's state.
 
 The permissions API takes the endpoint **id**, not its name:
 
@@ -245,18 +231,14 @@ databricks serving-endpoints update-permissions <endpoint-id> --json @acl.json
 ```
 
 Use `update-permissions` (merges), not `set-permissions` (replaces, and would
-drop your own CAN_MANAGE). Write the JSON file without a byte-order mark — the
-CLI rejects a BOM with *"invalid character 'ï' looking for beginning of value"*.
-
-The resulting ACL should read: the caller SP `CAN_QUERY`, you `CAN_MANAGE`,
-`admins` `CAN_MANAGE`.
+drop your own CAN_MANAGE). Write the JSON file without a byte-order mark.
 
 ### 7b. Endpoint SP → Lakebase, then least privilege
 
-The endpoint's own service principal usually gets its Postgres role and tables
-automatically on the first turn. Send one message through the endpoint, then
-find its application id — it is not in SCIM, but its first Lakebase connection
-creates a Postgres role named after it:
+The endpoint's own service principal gets its Postgres role and table grants
+automatically on the first turn. Send one message through the endpoint (§8),
+then find the role — it is not in SCIM, but its first Lakebase connection
+creates a Postgres role named after its application id:
 
 ```sql
 SELECT rolname FROM pg_roles;   -- the UUID-shaped role is the endpoint SP
@@ -265,23 +247,39 @@ SELECT rolname FROM pg_roles;   -- the UUID-shaped role is the endpoint SP
 Then **restrict it**, once the runtime has created its tables. Until you do, the
 serving identity holds full DML on every table in the schema — including the
 configuration that governs it and the audit trail that records it. An audit
-trail writable by the component it audits is not an audit trail.
+trail writable by the component it audits is not an audit trail. Run this in
+the instance's SQL editor (or `psql`) as the table owner, with `<role>` the
+application id and the schema set first:
 
+```sql
+SET search_path TO supervisor_dev;
+
+-- Policy is read-only from the data plane.
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER, REFERENCES ON supervisor_config FROM "<role>";
+GRANT  SELECT                                                ON supervisor_config TO   "<role>";
+
+-- The audit trail is append-only from the data plane.
+REVOKE UPDATE, DELETE, TRUNCATE, TRIGGER, REFERENCES         ON supervisor_audit_log FROM "<role>";
+GRANT  INSERT, SELECT                                        ON supervisor_audit_log TO   "<role>";
+
+-- A review is opened by the supervisor and resolved by the gateway, so the
+-- runtime keeps INSERT and UPDATE. DELETE is nobody's business.
+REVOKE DELETE, TRUNCATE, TRIGGER, REFERENCES                 ON supervisor_review_queue FROM "<role>";
+GRANT  INSERT, SELECT, UPDATE                                ON supervisor_review_queue TO   "<role>";
 ```
-python scripts/provision_lakebase.py --instance supervisor-memory --skip-instance \
-  --pg-schema supervisor_dev \
-  --grant-identity <endpoint-sp-application-id> --restrict-governance-tables --dry-run
 
-# review the SQL, then run it without --dry-run
-```
+`TRIGGER` is the one that matters: it would let the serving identity attach a
+trigger that fires with the privileges of whoever performs the next DML — the
+`publish_config` job identity — which is exactly the escalation around the
+RBAC gate this closes.
 
-Verify against the catalog rather than the script's output — a `REVOKE` reports
-success whether or not it removed anything:
+Verify against the catalog rather than trusting the statements — a `REVOKE`
+reports success whether or not it removed anything:
 
 ```sql
 SELECT table_name, privilege_type
   FROM information_schema.role_table_grants
- WHERE grantee = '<endpoint-sp-application-id>'
+ WHERE grantee = '<role>'
    AND table_schema = 'supervisor_dev'
    AND table_name IN ('supervisor_config','supervisor_audit_log','supervisor_review_queue')
  ORDER BY table_name, privilege_type;
@@ -289,63 +287,87 @@ SELECT table_name, privilege_type
 
 Expected exactly: `SELECT` on `supervisor_config`; `INSERT, SELECT` on
 `supervisor_audit_log`; `INSERT, SELECT, UPDATE` on `supervisor_review_queue`.
-Anything more — `TRIGGER` especially — means the revoke did not cover it.
-
 The `table_schema` filter matters: the same three table names exist in every
-environment's schema, so without it the query answers a question about all of
-them at once.
-
-> The role also holds `CREATE` on the *database*, granted alongside the schema
-> privileges. It permits creating schemas and nothing inside anyone else's, and
-> it is needed because the checkpointer and store issue
-> `CREATE SCHEMA IF NOT EXISTS` on every boot as this identity.
+environment's schema.
 
 Nothing in the request path writes configuration, so this breaks no runtime
-behaviour: the only writer is the `publish_config` job, which runs as a
-different identity.
+behaviour: the only writer is the `publish_config` task, which runs as you.
 
 ### 7c. Endpoint SP → prompt access
 
 For the endpoint to load prompts from the registry rather than falling back to
-the bundled text:
+the bundled text, its service principal needs the catalog and the environment's
+schema. There is no MLflow resource type for prompts, so `agents.deploy()`
+cannot grant this for you:
 
 ```
-python scripts/grant_prompt_access.py -e dev --principal <endpoint-sp-application-id> --write
+databricks grants update catalog <catalog> --json '{"changes":[{"principal":"<endpoint-sp-application-id>","add":["USE_CATALOG"]}]}'
+databricks grants update schema <catalog>.supervisor_<env> --json '{"changes":[{"principal":"<endpoint-sp-application-id>","add":["USE_SCHEMA","EXECUTE","CREATE_FUNCTION","MANAGE"]}]}'
 ```
 
-The read-only set is not enough. With MLflow tracing active, every prompt load
-also links the version to the trace, which needs create and update rights on the
-schema. The schema holds only this agent's artifacts, so the wider grant is
-contained; if that is not acceptable, keep the bundled-prompt fallback instead —
-it is behaviourally identical while the registry text matches the bundled text.
+The read-only set (`USE_SCHEMA`, `EXECUTE`) is not enough: with MLflow tracing
+active, every prompt load also links the version to the trace, which needs
+create and update rights on the schema. The schema holds only this agent's
+artifacts, so the wider grant is contained; if that is not acceptable, keep the
+bundled-prompt fallback — it is behaviourally identical while the registry text
+matches the bundled text.
+
+### 7d. Consuming agents → the library volume
+
+The deploy identity of any agent that installs the shared library needs to read
+the volume:
+
+```
+databricks grants update volume <catalog>.agent_platform.libs --json '{"changes":[{"principal":"<consumer-deploy-identity>","add":["READ_VOLUME"]}]}'
+```
 
 ---
 
 ## 8. Verify
 
+Send one real domain request through the endpoint, authenticating as yourself:
+
 ```
-python scripts/verify_deployment.py -e dev
+databricks serving-endpoints query agents_<catalog>-supervisor_<env>-supervisor_agent --json '{
+  "input": [{"role": "user", "content": "Write user stories for a password reset feature on product line alpha"}],
+  "custom_inputs": {"user_role": "BA", "agent_id": "requirement-agent",
+                    "permitted_agents": ["requirement-agent"], "user_id": "usr_verify"}
+}'
 ```
 
-It prints the environment it resolved, then reports the endpoint state, the
-prompts in Unity Catalog, what the endpoint actually loaded, and the audit table.
-Send one real domain request through the endpoint before trusting the prompt
-check — a cold endpoint has loaded nothing, and small talk is classified
-deterministically without touching a prompt.
+A governed refusal is a *successful* call — read `custom_outputs.outcome` with
+the text. Then read the endpoint's own log, which is the only place that says
+what the endpoint's identity could actually reach:
 
-Then confirm durable state exists **in this environment's schema**: after one
-governed turn there should be rows in `supervisor_<env>`'s checkpoint tables and
-at least one row in its `supervisor_audit_log`.
+```
+databricks serving-endpoints logs agents_<catalog>-supervisor_<env>-supervisor_agent <served-model-name>
+```
+
+Look for these lines, one each:
+
+| Line | Meaning |
+|---|---|
+| `checkpointer: Lakebase instance_name=…, schema=supervisor_<env>` | durable state is on, in this environment's schema |
+| `audit sink: Postgres table supervisor_audit_log` | the decision trail is queryable |
+| `configuration source: table supervisor_config` | the governed documents are live |
+| `loaded prompt prompts:/…@<env> v…` | prompts come from the registry; `prompt registry unavailable … bundled default` means §7c is missing |
+
+Then confirm durable state exists **in this environment's schema**:
 
 ```sql
 SET search_path TO supervisor_dev;
 SELECT count(*) FROM supervisor_audit_log;
+SELECT name, version, active FROM supervisor_config;
 ```
 
 Two failures look similar and are not. If those tables are empty and the endpoint
 log mentions an in-memory checkpointer, the Lakebase instance name did not reach
-the endpoint. If instead the rows turn up in `public`, the environment's schema
-did not exist when the runtime first wrote — go back to §5, then redeploy.
+the endpoint. If instead the rows turn up in `public`, `LAKEBASE_SCHEMA` did
+not reach the endpoint — check the endpoint's environment variables.
+
+Confirm the model artifact carries the library: in the registered model
+version's artifacts, `wheels/agent_governance-<version>-py3-none-any.whl` is
+present and `requirements.txt` ends with that same relative path.
 
 ---
 
@@ -353,27 +375,62 @@ did not exist when the runtime first wrote — go back to §5, then redeploy.
 
 | Changed | How it reaches the endpoint |
 |---|---|
-| `agents.yaml`, `rbac.yaml`, `guardrails.yaml` | `python scripts/publish_config.py --apply --lakebase-schema supervisor_dev` — a table write, into that environment's schema only. A running endpoint picks it up within the configuration cache TTL. **No redeploy** |
-| `src/supervisor/**` or `deploy/**` | `databricks bundle deploy -t dev` → `databricks bundle run supervisor_agent_deploy -t dev` → `wait_for_endpoint.py -e dev` |
+| `agents.yaml`, `rbac.yaml`, `guardrails.yaml` | `python deploy/publish_config.py --apply --lakebase-instance supervisor-memory --lakebase-schema supervisor_<env>` — a table write, into that environment's schema only. A running endpoint picks it up within the configuration cache TTL. **No redeploy** |
+| `src/supervisor/**` or `deploy/**` | `databricks bundle deploy -t <env>` → `databricks bundle run supervisor_agent_deploy -t <env>` → wait (§6) |
+| `libs/agent_governance/**` | Bump `agent_governance.__version__`, then the same redeploy: the new wheel is baked into the new model version and published to the volume. Consumers pick up the new version when they choose to |
 | Prompt text in `prompt_provider.py` | Same redeploy. While the endpoint uses the bundled fallback, a prompt change reaches it by redeploy, not by moving a registry alias |
 | `databricks.yml` variables | `bundle deploy` then `bundle run` again |
-| A **new** environment | Add the target to `databricks.yml` — every name derives from `${bundle.target}`, so nothing else changes. Then §5's schema command, §6 with `-t <env>`, and §7's grants for the new endpoint |
+| A **new** environment | Add the target to `databricks.yml` — every name derives from `${bundle.target}`. Then §6 with `-t <env>` and §7's grants for the new endpoint |
 
 Promotion from dev to prod is a `bundle run -t prod`, not a copy: prod builds its
 own model version from the same source and registers it in its own schema.
-Nothing moves between environments, and nothing in dev can change what prod
-serves.
 
 Onboarding a new worker agent is a configuration change, not a code change: add
 the entry to `agents.yaml` and the role mapping to `rbac.yaml`, publish to each
 environment you want it in, and grant the corresponding role in your identity
 provider.
 
-To remove one environment: `python scripts/teardown_databricks.py -e dev --yes`
-(it deletes the serving endpoint, which the bundle does not own) followed by
-`databricks bundle destroy -t dev`. It touches only that environment's objects.
-The Lakebase instance is shared — delete it separately, and drop the
-environment's Postgres schema by hand if you want its rows gone.
+**Erasing a data subject (GDPR Art. 17).** Two things hold personal data per
+user: the long-term memory row (validated identifiers such as a product line,
+keyed by the pseudonymous `user_key`) and the conversation checkpoints (keyed
+by `thread_id`). Both are ordinary Postgres rows in the environment's schema,
+so an erasure is SQL run as the table owner:
+
+```sql
+SET search_path TO supervisor_<env>;
+
+-- What is held for the subject. Keys only: the values are the personal data.
+SELECT key, jsonb_object_keys(value) AS field
+  FROM store WHERE prefix = 'supervisor.resolved_context' AND key = '<user_key>';
+
+DELETE FROM store WHERE prefix = 'supervisor.resolved_context' AND key = '<user_key>';
+
+-- Each conversation the subject asks to have removed (thread ids come from
+-- the audit table: SELECT DISTINCT conversation_id FROM supervisor_audit_log WHERE user_key = '<user_key>').
+DELETE FROM checkpoint_writes WHERE thread_id = '<conversation_id>';
+DELETE FROM checkpoint_blobs  WHERE thread_id = '<conversation_id>';
+DELETE FROM checkpoints       WHERE thread_id = '<conversation_id>';
+```
+
+Re-run the `SELECT` afterwards to confirm nothing remains, and record the
+request and its completion in your change log. Do **not** hand-insert a row
+into `supervisor_audit_log` to record it: that table is a hash chain written
+only by the runtime, and a row inserted without its digest breaks every
+verification after it. The audit rows themselves carry no message text — the
+decision trail is redacted before it is written — and stay as the record that
+the subject's requests were governed.
+
+To remove one environment: delete the serving endpoint (the bundle does not own
+it), then destroy the bundle. Both touch only that environment's objects:
+
+```
+databricks serving-endpoints delete agents_<catalog>-supervisor_<env>-supervisor_agent
+databricks bundle destroy -t <env>
+```
+
+The Lakebase instance and the platform volume are shared — delete them
+separately, and drop the environment's Postgres schema by hand if you want its
+rows gone.
 
 ---
 
@@ -381,15 +438,55 @@ environment's Postgres schema by hand if you want its rows gone.
 
 | Symptom | First thing to check |
 |---|---|
-| `bundle run` → *"Triggering new runs … is currently disabled temporarily"* | Account credits or entitlements, not the bundle. `w.warehouses.start(...)` tends to state the real reason |
-| A job task dies with `NameError: name '__file__' is not defined` | Serverless `exec`s the script rather than importing it. Use the `_repo_root()` fallback the other job scripts carry |
-| A task's log shows success but the task is `FAILED` with `SystemExit: 0` | The script exits explicitly on success. Any escaping exception is a task failure, a zero exit included — exit only on a real failure code |
-| `log_and_deploy` → *"Endpoint … is currently updating"* | A previous rollout is still in progress. Wait for `wait_for_endpoint.py`, then re-run |
+| `bundle deploy` → *"no wheel"* / build error under `libs/agent_governance` | Python and `pip` on the local path; `python -m pip wheel --no-deps --wheel-dir libs/agent_governance/dist libs/agent_governance` by hand shows the real error |
+| `log_and_deploy` → `ModuleNotFoundError: agent_governance` | The job environment did not install the wheel — the `dependencies` glob in `databricks.yml` must match a built file |
+| Endpoint build log → *"No such file: wheels/agent_governance-…whl"* | The wheel was not logged next to the model. Check the registered version's artifacts; it is written by `log_model_artifacts` *before* `register_model` |
+| `bundle run` → *"Triggering new runs … is currently disabled temporarily"* | Account credits or entitlements, not the bundle |
+| A job task dies with `NameError: name '__file__' is not defined` | Serverless `exec`s the script rather than importing it. Use the `_repo_root()` fallback the deploy scripts carry |
+| A task's log shows success but the task is `FAILED` with `SystemExit: 0` | The script exited explicitly on success. Exit only on a real failure code |
+| `log_and_deploy` → *"Endpoint … is currently updating"* | A previous rollout is still in progress. Wait for `NOT_UPDATING`, then re-run |
 | *"Could not open requirements file"* in the job | A stale `.databricks/` sync snapshot from another workspace. Delete the folder and redeploy |
-| Callers get 403 / "agent unavailable" while your own scripts work | §7a — your scripts authenticate as you, the front door as the service principal |
+| Callers get 403 / "agent unavailable" while your own calls work | §7a — you authenticate as you, the front door as the service principal |
 | Endpoint log says it fell back to bundled prompts | §7c. Harmless while the registry text matches the bundled text |
-| Audit table empty | The Postgres sink is the real store. The Delta table is optional and unwired unless you set a warehouse id. Also check `search_path` — you may be reading a different environment's schema from the one the endpoint writes to |
-| Conversation history lost between turns | The endpoint has no Lakebase instance — check the bundle variable reached it, and that the instance is AVAILABLE |
+| Audit table empty | Check `search_path` — you may be reading a different environment's schema from the one the endpoint writes to |
+| Conversation history lost between turns | The endpoint has no Lakebase instance — check the variable reached it, and that the instance is AVAILABLE |
 | Endpoint refuses to boot: *"refusing to degrade to in-memory state"* | Working as intended. Every deployed environment, `dev` included, requires durable state. Either Lakebase is unreachable, or `ENVIRONMENT` was set to a deployed name on a workstation — use `local` there |
-| Two environments' rows in the same tables | The environment's schema was never created, so `search_path` fell through to `public`. Run §5's schema command and redeploy; rows already in `public` stay there |
-| An operator script reports the endpoint is missing after a healthy deploy | It derived a different environment's name. Pass `-e <env>`, or check `$ENVIRONMENT` — the scripts default to it |
+| Endpoint log: *"audit table … predates latency_ms, …"* | The table was created by an earlier version. Widen it as its owner with the block below |
+| `publish_library` → *"already published — left as is"* | Expected on a redeploy without a version bump. Bump `agent_governance.__version__` to release a library change |
+
+Audit-table migration, for a table created before these columns existed (run
+as the table's owner, schema set first):
+
+```sql
+SET search_path TO supervisor_dev;
+ALTER TABLE supervisor_audit_log ADD COLUMN IF NOT EXISTS latency_ms INTEGER;
+ALTER TABLE supervisor_audit_log ADD COLUMN IF NOT EXISTS session_age_seconds DOUBLE PRECISION;
+ALTER TABLE supervisor_audit_log ADD COLUMN IF NOT EXISTS signoff JSONB;
+ALTER TABLE supervisor_audit_log ADD COLUMN IF NOT EXISTS model_calls INTEGER;
+ALTER TABLE supervisor_audit_log ADD COLUMN IF NOT EXISTS tokens_estimated INTEGER;
+ALTER TABLE supervisor_audit_log ADD COLUMN IF NOT EXISTS provenance JSONB;
+ALTER TABLE supervisor_audit_log ADD COLUMN IF NOT EXISTS prev_hash TEXT;
+ALTER TABLE supervisor_audit_log ADD COLUMN IF NOT EXISTS row_hash TEXT;
+```
+
+---
+
+## Appendix — consuming the library from another agent
+
+What the requirement, test-case, coding and deployment agents do to run the
+same governance code as the supervisor. Their deploy job:
+
+1. Installs the published wheel:
+   `pip install /Volumes/<catalog>/agent_platform/libs/agent_governance-<version>-py3-none-any.whl`
+   (or names that path in the job environment's `dependencies`).
+2. Logs the same file next to their model — `wheels/<file>.whl` in the model's
+   `pip_requirements`, the file added with `MlflowClient().log_model_artifacts`
+   before `register_model` — exactly as `deploy/log_and_deploy.py` does here.
+3. In code: `from agent_governance.trust import trust_secret, verify_dispatch`
+   to check the supervisor's dispatch signature,
+   `agent_governance.sanitize` on inbound text, `agent_governance.output_guard`
+   on every reply, and `agent_governance.audit` for the decision trail. The
+   library's README lists the module map.
+
+Pin the version. A wheel on the volume is never overwritten under the same
+name, so a pinned consumer cannot change under you.

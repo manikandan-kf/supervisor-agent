@@ -27,70 +27,103 @@ create in the workspace, step order, grants and verification.
 | `approval` | Stages irreversible work for human sign-off using LangGraph `interrupt()`, and records who approved what |
 | `respond` | Emits the answer and writes the decision trail. A governance decision is not reported as applied unless its audit record landed |
 
-## Layout
+## Two packages, one repository
+
+The security and governance primitives are **not** the supervisor's alone: the
+requirement, test-case, coding and deployment agents that follow will apply the
+same screens and write the same audit shape. So they live in a separate,
+installable library, and the supervisor is its first consumer.
 
 ```
-src/supervisor/
+libs/agent_governance/               the shared library — one wheel every agent installs
+  src/agent_governance/
+    sensitive.py       the sensitive-shape catalogue every boundary reads, + redact helpers
+    output_guard.py    response policy: allow / mask / block / escalate, and the stream guard
+    sanitize.py        untrusted text handling: control chars, fake turn boundaries, directives
+    deny_rules.py      tier-1 deterministic deny patterns and the kill switch
+    prompting.py       untrusted content in its own JSON turn; cacheable system prefix
+    grounding.py       execution claims and citations nothing in the turn backs
+    trust.py           HMAC over entitlements and dispatches — a worker calls verify_dispatch
+    rbac.py            role → agent authorization
+    deadline.py        per-turn time budget
+    resilience.py      bounded retries for transient model failures
+    spend.py           per-turn and per-subject cost ceilings
+    audit.py           decision-trail sink with the tamper-evident hash chain
+    review_queue.py    appeal / escalation queue — opened by an agent, resolved by a reviewer surface
+    locking.py         one execution per conversation: the advisory lock Model Serving does not provide
+    config_store.py    governed configuration in a table: checksummed, validated, TTL-cached
+    lakebase.py        Lakebase pools, checkpointer and store builders, connection sources
+    sql.py             identifier validation; the schema-aware table probe
+    environment.py     is_local_environment, resource_environment, catalog, environment_schema
+  tests/               the library's own tests, offline
+
+src/supervisor/                      the supervisor agent
   agent.py           MLflow ResponsesAgent wrapper — predict / predict_stream
-  graph.py           StateGraph wiring, retry policy, durability
+  graph.py           StateGraph wiring and durability
   nodes.py           the six stages above
+  messages.py        every sentence the supervisor says in its own voice
   state.py           the conversation state channels
   context.py         per-request runtime context (role, entitlements, identity)
   registry.py        worker agent registry
-  rbac.py            role → agent authorization
-  guardrails.py      two-tier domain screen
+  guardrails.py      the semantic domain screen, small-talk classifier, ownership contest
   routing.py         context resolution and clarification
-  dispatch.py        worker client: timeout, retry, circuit breaker
-  sensitive.py       the sensitive-shape catalogue every boundary reads
-  output_guard.py    response policy applied before delivery, and on the relay
-  grounding.py       execution claims and citations nothing in the turn backs
-  sanitize.py        untrusted worker output handling
-  progress.py        the task-plan events streamed while a turn runs
-  memory.py          checkpointer, long-term store, Postgres wiring
+  dispatch.py        worker client: timeout, retry, circuit breaker; the simulated worker
+  memory.py          the supervisor's Lakebase schema; long-term memory — validated
+                     on write, narrowed on read, aged out on a retention ceiling
   session_notes.py   "keep this in mind for later" — short-term, this thread only
-  config_store.py    governed configuration read from Unity Catalog / Postgres
-  review_queue.py    appeal and escalation queue
-  audit.py           decision-trail sinks, incl. the tamper-evident hash chain
-  spend.py           per-turn and per-subject cost ceilings
-  deadline.py        per-turn time budget
-  locking.py         one active turn per conversation
+  config.py          the supervisor's governed documents and their validators
+  progress.py        the task-plan events streamed while a turn runs
+  prompt_provider.py prompts from the MLflow registry, bundled fallbacks
+  model_provider.py  the ChatDatabricks client for the routing model (and per-agent models)
+  services.py        the dependency container
   settings.py        every tunable, read from the environment
   config/            agents.yaml · rbac.yaml · guardrails.yaml (seed documents)
 
-deploy/log_and_deploy.py   logs, registers and deploys the model
-scripts/                   deploy, verify and operate — see DEPLOYMENT.md
-tests/                     the governance contract, offline — see Tests below
-databricks.yml             the asset bundle
-pyproject.toml             project metadata, dependencies, ruff and pytest config
-requirements.txt           what the serving container installs — pinned exactly
-.github/workflows/ci.yml   lint, SAST, tests, SBOM, dependency and secret scans
+deploy/
+  log_and_deploy.py    logs, registers and deploys the model, with the library wheel baked in
+  register_prompts.py  registers the prompts in Unity Catalog under the environment alias
+  publish_config.py    publishes the governed documents to the configuration table
+  publish_library.py   publishes the library wheel to the platform volume, for other agents
+tests/                 the supervisor's governance contract, offline
+databricks.yml         the asset bundle: schema, library artifact, deploy job
+pyproject.toml         project metadata, dependencies, ruff and pytest config
+requirements.txt       what the serving container installs — pinned exactly
 ```
 
-## Operating it
+## How the library reaches every agent
 
-Beyond deployment, the scripts that answer the questions this agent gets asked
-in production:
+Databricks offers several ways to share code between agents. This project uses
+a **Python wheel**, for the reason the alternatives fail here:
 
-| | |
-|---|---|
-| `verify_audit_chain.py` | walk the audit hash chain — was history altered? |
-| `trace_turn.py` | the whole flow of one turn: every stage, every model call |
-| `inspect_lakebase.py` | what is actually in short-term and long-term memory |
-| `kpi_report.py` | KPIs computed from the data already stored |
-| `show_prompts.py` | what is registered, what the endpoint loads, and the diff |
-| `verify_stream.py` | does the deployed endpoint really stream |
-| `erase_subject.py` | erase or purge a subject's long-term memory (GDPR Art. 17) |
-| `export_delta_mirror.py` | backfill the decision trail into governed Delta tables |
+* **Unity Catalog functions** are SQL or Python UDFs executed on a warehouse or
+  a cluster. They suit a tool an agent *calls*; they do not suit a regex
+  catalogue applied to every token of a streamed reply, and the serving
+  endpoint's identity cannot hold `databricks-sql-access` in any case.
+* **`code_paths` copies of the source** in each agent's repository drift the
+  day the second copy is edited — exactly what a shared guardrail must not do.
+* **A wheel** is versioned, testable on its own, installed into a job or a
+  serving container like any other dependency, and imports at native speed.
 
-Each takes `-e/--environment` (or the equivalent) and derives the rest, so none
-of them can address two environments at once. All are read-only except
-`erase_subject.py`, which requires an explicit `--apply`.
+Three moments in the supervisor's deploy make it work:
 
-**This repository is the supervisor agent only.** The identity provider, the
-front door that calls this agent's API, and the user interface are separate
-deployables owned by other teams. Nothing here contains or imports them; where
-the documentation names "the caller", it means whichever service holds the
-endpoint's `CAN_QUERY` grant and signs the entitlements the RBAC gate checks.
+1. `databricks bundle deploy` builds `libs/agent_governance/dist/*.whl` (the
+   `artifacts` block) and installs it into the deploy job's environment.
+2. `deploy/log_and_deploy.py` logs the wheel *inside* the model artifact under
+   `wheels/` and names it as `wheels/<file>.whl` in the model's requirements —
+   the layout MLflow's own `add_libraries_to_model` produces and Model Serving
+   installs from. The endpoint never depends on a volume or an index at build
+   time, and the library it runs is the one that was tested.
+3. `deploy/publish_library.py` copies the same wheel to the platform volume,
+   `/Volumes/<catalog>/agent_platform/libs/`, where the other agents install it
+   from. A version already present is never overwritten: bump
+   `agent_governance.__version__` to release a change.
+
+A consuming agent adds two lines to its own deploy: pull the wheel from the
+volume, and log it the way step 2 does. The library's
+[README](libs/agent_governance/README.md) shows the imports. When the library
+gets its own repository — the natural next step once a second agent consumes
+it — `libs/agent_governance/` moves as a unit with its tests and pyproject, and
+`publish_library.py` goes with it.
 
 ## Environments
 
@@ -111,116 +144,91 @@ new target in `databricks.yml` and no other edit:
 
 One Lakebase instance serves both; the **Postgres schema** is what keeps them
 apart — checkpoints, long-term memory, the governed configuration table, the
-review queue and the audit trail all land in it. Point a target at its own
-`lakebase_instance` when the environments need physically separate databases.
+review queue and the audit trail all land in it. The runtime creates the
+schema itself on the first connection, so nothing has to be pre-created.
 
 **`dev` is a deployment, not a mode.** It is held to the same runtime contract
 as prod: durable state or refuse to boot, no safety-critical setting disabled,
-every turn under a time budget. `ENVIRONMENT=local` — the value in
-`.env.example`, because that file configures a workstation — is the only one that
-relaxes any of it.
+every turn under a time budget. `ENVIRONMENT=local` — the value a workstation
+uses — is the only one that relaxes any of it.
 
-**One value selects an environment, everywhere.** The bundle target drives the
-deploy, `-e/--environment` drives the operator scripts, and `ENVIRONMENT` drives
-the running process — each derives the prompt alias, the Unity Catalog schema and
-the Lakebase schema from that single value, so they cannot disagree:
-
-```
-databricks bundle deploy -t prod          # deploys prod
-python scripts/verify_deployment.py -e prod   # verifies prod
-ENVIRONMENT=prod                          # the process reads prod
-```
-
-Each derived name can still be overridden on its own (`PROMPT_ALIAS`,
-`PROMPT_CATALOG_SCHEMA`, `LAKEBASE_SCHEMA`, `SUPERVISOR_CATALOG`) for the shapes
-the convention does not cover — a second isolated copy of one environment, a
-release candidate pinned under another alias, or a migration from a
-single-schema deployment (`LAKEBASE_SCHEMA=public`). Overriding is how you point
-a workstation at another environment's data, and it is deliberately more than a
-one-word edit.
-
-Create each environment's Lakebase schema before its first deploy —
-[DEPLOYMENT.md](DEPLOYMENT.md) has the command and the reason it cannot be
-skipped.
+**One value selects an environment.** The bundle target drives the deploy and
+`ENVIRONMENT` drives the running process; each derives the prompt alias, the
+Unity Catalog schema and the Lakebase schema from that single value. Each
+derived name can still be overridden on its own (`PROMPT_ALIAS`,
+`PROMPT_CATALOG_SCHEMA`, `LAKEBASE_SCHEMA`, `PLATFORM_CATALOG`) for the shapes
+the convention does not cover.
 
 ## Configuration
 
 Two layers, deliberately separate:
 
 **Environment variables** — infrastructure and tunables (endpoints, timeouts,
-budgets, storage). Defined in `settings.py`; copy `.env.example` to `.env` for
-local script runs. The deployed endpoint gets these from the bundle, not from
-`.env`.
+budgets, storage). Defined and documented in `settings.py`. The deployed
+endpoint gets these from the bundle (`deploy/log_and_deploy.py` stamps them).
 
 **Governed documents** — `agents.yaml`, `rbac.yaml` and `guardrails.yaml` hold
 the worker registry, the role mapping and the guardrail rules. These are
 **published to a table**, not baked into the image: after the first deploy a
-change is `python scripts/publish_config.py --apply` on its own, and a running
+change is `python deploy/publish_config.py --apply` on its own, and a running
 endpoint picks it up within the configuration cache TTL. No redeploy. The files
 in `src/supervisor/config/` are the seed and the fallback.
 
 The table lives in the environment's own Lakebase schema, so publishing to dev
-cannot change what prod serves. `publish_config.py` prints which schema it is
-about to write to; pass `--lakebase-schema` to target another.
+cannot change what prod serves. Pass `--lakebase-instance` and
+`--lakebase-schema` (or set `LAKEBASE_INSTANCE` / `LAKEBASE_SCHEMA`) to say
+which; the script prints the target before it writes.
 
 `guardrails.yaml` also carries the **output policy**: what happens to each
 category of sensitive finding in a reply — `allow`, `mask`, `block` or
 `escalate` — plus the bulk-disclosure threshold and any canary tokens planted
-in real workers' prompts. Defaults withhold credentials, government
-identifiers, payment and bank data and health identifiers, and mask names,
-contact details, dates of birth, health conditions and internal network
-detail. Every one is a line to change and a publish to apply; a publish that
-sets a withheld category to `allow` is refused rather than honoured.
+in real workers' prompts. A publish that sets a withheld category to `allow` is
+refused rather than honoured.
 
 ## Local development
 
 ```
 python -m venv .venv
-.venv/bin/python -m pip install -e ".[dev]"   # Windows: .venv\Scripts\python.exe
-.venv/bin/ruff check .                        # lint and the security ruleset
-.venv/bin/pytest                              # the governance contract, offline
+.venv/bin/python -m pip install -e libs/agent_governance -e ".[dev]"   # Windows: .venv\Scripts\python.exe
+.venv/bin/ruff check .                                                  # lint and the security ruleset
+.venv/bin/pytest                                                        # both test trees, offline
 ```
 
 `ruff check .` and `pytest` run in CI on every push and pull request, and the
-results are uploaded as a retained artifact — see `.github/workflows/ci.yml`.
-`CONTRIBUTING.md` covers what a change is expected to include, and how to move a
-dependency pin.
+results are uploaded as a retained artifact — see `.github/workflows/ci.yml`,
+which also builds the library wheel. `CONTRIBUTING.md` covers what a change is
+expected to include.
 
 ## Tests
 
 ```
-pytest                 # 219 tests, under 5 seconds
+pytest                 # 200 tests, under 20 seconds
 ```
 
 Everything runs **offline** — no workspace, no network, no database. External
-systems are faked at their client boundary, and each test says which. A bare
-`pytest` works in a fresh clone: `tests/conftest.py` puts `src/` on the path, so
-nothing needs installing or exporting first.
-
-One file per stage of the pipeline, plus the properties that cut across it:
+systems are faked at their client boundary. A bare `pytest` works in a fresh
+clone: each tree's `conftest.py` puts its source on the path.
 
 | | |
 |---|---|
-| `test_rbac.py` | which roles may reach which agent |
-| `test_guardrails.py` | deterministic deny patterns, then the semantic domain screen |
-| `test_graph.py` | the pipeline end to end, every stage in order |
-| `test_audit.py` | the decision trail is written, and its hash chain |
-| `test_failsafes.py` | refuse rather than degrade |
-| `test_injection_patterns.py` | untrusted content stays data, never instructions |
-| `test_small_talk.py` | deterministic classification before any model call |
-| `test_output_guard.py` | response policy and redaction before delivery |
-| `test_sensitive_detection.py` | what the sensitive-shape catalogue must catch, and must not |
-| `test_windowing.py` | the conversation window is bounded in tokens, not messages |
+| `tests/test_graph.py` | the pipeline end to end, every stage in order |
+| `tests/test_guardrails.py` | deterministic deny patterns, then the semantic domain screen |
+| `tests/test_failsafes.py` | refuse rather than degrade; the appeal path |
+| `tests/test_injection_patterns.py` | the shipped tier-1 patterns: what they catch and must not |
+| `tests/test_output_guard_pipeline.py` | response policy and redaction before delivery, through the graph |
+| `tests/test_memory.py` | what long-term memory accepts, narrows to the asking agent, and ages out |
+| `libs/agent_governance/tests/test_output_guard.py` | the guard itself: tiers, masking, policy rules |
+| `libs/agent_governance/tests/test_sensitive_detection.py` | what the sensitive-shape catalogue must catch, and must not |
+| `libs/agent_governance/tests/test_audit.py` | the decision trail is written from any identity |
+| `libs/agent_governance/tests/test_review_queue.py` | appeals are enumerable, resolved by exactly one reviewer, and a granted retry is spent once |
+| `libs/agent_governance/tests/test_locking.py` | one execution per conversation: key derivation, contention refused, plumbing failure fails open |
+| `libs/agent_governance/tests/test_rbac.py` | which roles may reach which agent |
 
 These are the contract, not a smoke test: each asserts a governance property the
 supervisor is supposed to hold, so a change that breaks one is a change to what
 the agent guarantees. Add to them rather than around them.
 
-`ruff.toml` is the lint and SAST baseline — the `S` ruleset is a port of
-flake8-bandit, so `ruff check .` covers both. Every suppression in that file
-documents the enforced property it rests on.
-
 ## Working agreement
 
 Default branch `main`, short-lived feature branches, PR review to merge, no
-force-push to `main`. Run `ruff check .` before opening a PR.
+force-push to `main`. Run `ruff check .` and `pytest` before opening a PR.

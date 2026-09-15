@@ -18,22 +18,23 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, Protocol
 
+from agent_governance.prompting import untrusted_turn
+from agent_governance.resilience import is_transient, jittered
+from agent_governance.trust import (
+    DISPATCH_SIGNATURE_FIELD,
+    new_nonce,
+    sign_dispatch,
+    trust_secret,
+)
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from .prompt_provider import get_prompt, untrusted_turn
-from .resilience import is_transient, jittered
-from .trust import DISPATCH_SIGNATURE_FIELD, new_nonce, sign_dispatch, trust_secret
+from .prompt_provider import get_prompt
 
 logger = logging.getLogger(__name__)
 
 
 class WorkerUnavailable(Exception):
     """The worker could not be reached after retries, or its circuit is open."""
-
-
-# The classification moved to `resilience` so the governance-call retries share
-# it; the old name stays importable because tests and callers pin it.
-_is_transient = is_transient
 
 
 class CircuitBreaker:
@@ -133,8 +134,8 @@ class ModelServingWorkerClient:
         retry/circuit-breaker machinery below never engages because a hang
         raises nothing to classify. Setting it is what turns "the worker is
         wedged" into a transient failure this class already knows how to handle:
-        `_is_transient` matches on "timeout", so a bounded call feeds straight
-        into retry-with-backoff and then the breaker.
+        `resilience.is_transient` matches on "timeout", so a bounded call feeds
+        straight into retry-with-backoff and then the breaker.
         """
         if self._w is None:
             from databricks.sdk import WorkspaceClient
@@ -196,7 +197,7 @@ class ModelServingWorkerClient:
             if deadline is not None:
                 # Raises `BudgetExhausted`, which the node turns into a governed
                 # outcome. Deliberately not caught by the `except Exception`
-                # below — `_is_transient` would not match it anyway, but more
+                # below — `is_transient` would not match it anyway, but more
                 # importantly an exhausted budget must never be retried: the
                 # retries are what spent it.
                 deadline.ensure(f"attempt {attempt + 1} to {agent.id}")
@@ -206,7 +207,7 @@ class ModelServingWorkerClient:
                 )
             except Exception as exc:  # noqa: BLE001 — classified below
                 last_error = exc
-                if not _is_transient(exc):
+                if not is_transient(exc):
                     # A permission or contract failure will not heal with a
                     # retry; let the node's generic error path handle it.
                     self._breaker.record_failure(agent.id)
@@ -314,7 +315,7 @@ def _plant_canary(rules: str) -> str:
     has no such seam — a registered prompt rewritten without paragraphs must
     still carry the canary somewhere.
     """
-    from .output_guard import PROCESS_CANARY
+    from agent_governance.output_guard import PROCESS_CANARY
 
     line = _CANARY_LINE.format(canary=PROCESS_CANARY)
     marker = "\n\n<untrusted_content_policy>"

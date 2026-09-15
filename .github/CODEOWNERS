@@ -8,16 +8,12 @@
 # Everything, by default.
 *                               @<org>/<platform-team>
 
-# The governance surface. A change to any of these changes what the agent is
-# allowed to do, or what it can be shown to have done, so it deserves a named
-# reviewer rather than the default one.
+# The governance surface. A change to any of these changes what every agent on
+# the platform is allowed to do, or what it can be shown to have done, so it
+# deserves a named reviewer rather than the default one.
+/libs/agent_governance/         @<org>/<security-team>
 /src/supervisor/guardrails.py   @<org>/<security-team>
-/src/supervisor/output_guard.py @<org>/<security-team>
-/src/supervisor/sensitive.py    @<org>/<security-team>
-/src/supervisor/sanitize.py     @<org>/<security-team>
-/src/supervisor/rbac.py         @<org>/<security-team>
-/src/supervisor/trust.py        @<org>/<security-team>
-/src/supervisor/audit.py        @<org>/<security-team>
+/src/supervisor/config.py       @<org>/<security-team>
 /src/supervisor/config/         @<org>/<security-team>
 /SECURITY.md                    @<org>/<security-team>
 

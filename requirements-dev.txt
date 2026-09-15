@@ -1,12 +1,16 @@
 # Developer tooling. Not installed into the serving container — the deploy job
-# installs requirements.txt only.
+# installs requirements.txt and bakes the governance wheel into the model.
 #
-# Equivalent to `pip install -e ".[dev]"`; kept as a file so CI can install the
-# runtime and the tooling in one step without building the package first.
+# Equivalent to `pip install -e libs/agent_governance -e ".[dev]"`; kept as a
+# file so CI can install the runtime and the tooling in one step.
+
+# The shared governance library, editable, so a change in libs/ is visible to
+# the supervisor's tests without a rebuild.
+-e libs/agent_governance
 
 # Lint + security ruleset (see [tool.ruff] in pyproject.toml).
 ruff==0.14.6
 
-# The test suite in tests/. Everything there runs offline — no workspace, no
-# network, no database — so `pytest` needs nothing configured first.
+# Both test trees. Everything runs offline — no workspace, no network, no
+# database — so `pytest` needs nothing configured first.
 pytest==9.1.1

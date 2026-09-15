@@ -6,19 +6,24 @@ any of them without changing the graph.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
-from .audit import build_audit_logger
-from .config_store import ConfigProvider, Reloading
+from agent_governance import audit
+from agent_governance.config_store import Reloading
+from agent_governance.output_guard import OutputGuard
+from agent_governance.rbac import RbacPolicy
+from agent_governance.review_queue import NullReviewQueue, ReviewQueue
+from agent_governance.spend import SubjectWindow, build_spend_window
+
+from .config import SupervisorConfig
 from .dispatch import CircuitBreaker, ModelServingWorkerClient, SimulatedWorkerClient
-from .memory import LongTermMemory, build_store
-from .output_guard import OutputGuard
-from .rbac import RbacPolicy
+from .memory import LongTermMemory, audit_connection_source, build_store
 from .registry import AgentRegistry
-from .review_queue import NullReviewQueue, build_review_queue
 from .routing import Router
 from .settings import Settings
-from .spend import SubjectWindow, build_spend_window
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -39,8 +44,8 @@ class Services:
     audit: object  # exposes .log(record)
     memory: LongTermMemory
     # The appeal / escalation queue (§05 Stage 03, Stage 04). Exposes
-    # .open_review(...), .resolve(...), .claim_allowance(...), .get(...),
-    # .list_open(...) and .open_for_conversation(...). Defaults to a
+    # .open_review(...), .resolve(...), .claim_allowance(...), .get(...) and
+    # .list_open(...). Defaults to a
     # `NullReviewQueue` so a hand-built `Services` in a test needs no argument;
     # that stand-in raises on every write, which is the correct behaviour rather
     # than a convenience — an appeal that cannot be recorded must not be
@@ -64,6 +69,30 @@ class Services:
     # which is what a hand-built `Services` in a test and an unconfigured
     # deployment both want.
     spend_window: object = field(default_factory=SubjectWindow)
+
+
+def build_audit_logger(settings: Settings):
+    """The decision-trail sink over the same Postgres the checkpointer uses."""
+    return audit.build_audit_logger(audit_connection_source(), settings.audit_pg_table)
+
+
+def build_review_queue(settings: Settings):
+    """The appeal queue in the same Postgres as the audit sink, or a null one.
+
+    Same database on purpose: an appeal is a governance record, and putting it
+    anywhere else would mean a reviewer queries one store for the decision and
+    another for the appeal against it.
+    """
+    source = audit_connection_source()
+    if source is None:
+        logger.warning(
+            "review queue: none configured — appeals and escalations cannot be "
+            "recorded as queryable state, so Stage 03's appeal path is not met. "
+            "Configure Lakebase (LAKEBASE_INSTANCE)."
+        )
+        return NullReviewQueue()
+    logger.info("review queue: Postgres table %s", settings.review_queue_table)
+    return ReviewQueue(source, settings.review_queue_table)
 
 
 def build_services(settings: Settings | None = None) -> Services:
@@ -102,12 +131,12 @@ def build_services(settings: Settings | None = None) -> Services:
         )
     )
 
-    # Governance configuration comes from the UC-registered table when one is
-    # reachable, and from the bundled YAML when it is not — `config_store` owns
-    # that choice, the validation and the fallback. Wrapped in `Reloading` so a
+    # Governance configuration comes from the governed table when one is
+    # reachable, and from the bundled YAML when it is not — `config` owns that
+    # choice, the validation and the fallback. Wrapped in `Reloading` so a
     # config published while this process is alive is picked up on the next
     # request rather than at the next deploy.
-    config = ConfigProvider(settings)
+    config = SupervisorConfig(settings)
 
     return Services(
         settings=settings,
@@ -135,11 +164,11 @@ def build_services(settings: Settings | None = None) -> Services:
         # Passed as a callable for the same reason the registry is a proxy: the
         # registry can now change under a live process, and an allowlist frozen
         # here would refuse a context key added to the table a minute ago.
-        memory=LongTermMemory(build_store(), allowed_keys=lambda: config.registry().context_keys()),
-        # Same Postgres as the audit sink and the config table — an appeal is a
-        # governance record, and putting it anywhere else would mean a reviewer
-        # queries one store for the decision and another for the appeal against
-        # it.
+        memory=LongTermMemory(
+            build_store(),
+            allowed_keys=lambda: config.registry().context_keys(),
+            ttl_seconds=settings.long_term_memory_ttl_seconds,
+        ),
         reviews=build_review_queue(settings),
         # Built from the same governed guardrails document as the input engine,
         # through the same Reloading proxy, so publishing an output rule needs

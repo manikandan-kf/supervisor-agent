@@ -9,9 +9,6 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from pathlib import Path
-
-import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -73,16 +70,12 @@ class AgentRegistry:
         self._agents = {a.id: a for a in agents}
 
     @classmethod
-    def from_yaml(cls, path: Path) -> "AgentRegistry":
-        return cls.from_mapping(yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {})
-
-    @classmethod
     def from_mapping(cls, data: dict) -> "AgentRegistry":
-        """Build from an already-parsed document.
+        """Build from the parsed agents document.
 
-        The parsing seam: `from_yaml` reads a file, `config_store` reads a row
-        in the governed table, and both end up here so the two sources cannot
-        drift into interpreting the same document differently.
+        The one parsing seam: whether the document came from the bundled YAML
+        or from a row in the governed table (`config_store`), it is interpreted
+        here, so the two sources cannot drift.
         """
         data = data or {}
         agents = [

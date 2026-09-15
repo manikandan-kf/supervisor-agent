@@ -11,11 +11,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from agent_governance.prompting import untrusted_turn
+from agent_governance.resilience import invoke_with_retries
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from .prompt_provider import get_prompt, untrusted_turn
-from .resilience import invoke_with_retries
+from .prompt_provider import get_prompt
 
 
 @dataclass(frozen=True)
@@ -90,9 +91,6 @@ class RouteDecision(BaseModel):
         description="One short question about the single most important missing item; null when ready",
     )
 
-
-# The name tests and older callers imported before the class went public.
-_RouteDecision = RouteDecision
 
 # §4.1: prompts load from MLflow Prompt Registry by name and environment alias.
 _PROMPT_NAME = "supervisor_routing"

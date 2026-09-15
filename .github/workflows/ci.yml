@@ -3,18 +3,15 @@
 # Three controls exist in this repository and none of them produces evidence
 # unless something automated runs them:
 #
-#   * `ruff check --select S` — the SAST pass. A governance programme that names
-#     "pipeline scan results" as its evidence artifact for vulnerability
-#     management gets none from a linter an engineer runs locally.
-#   * `pytest` — the governance contract, including the fault-injection and
-#     negative-authorization cases. A test only counts as evidence if it can be
-#     shown to have run.
+#   * `ruff check --select S` — the SAST pass.
+#   * `pytest` — the governance contract (the supervisor's tests) and the
+#     shared library's own tests, including the fault-injection and
+#     negative-authorization cases.
 #   * the dependency tree — for an agent, most of the attack surface is code
 #     nobody here wrote (OWASP Top 10 for Agentic Applications 2026, ASI04).
 #
 # The artifact upload is the point of the last step in each job: a run of this
-# workflow *is* the evidence-pack entry, retained and linkable, rather than a
-# claim that the checks pass.
+# workflow *is* the evidence-pack entry, retained and linkable.
 
 name: CI
 
@@ -23,12 +20,9 @@ on:
     branches: ["**"]
   pull_request:
   # Manual runs matter for the evidence pack: an assessor asking "when were the
-  # controls last checked" needs a way to produce a dated run without waiting
-  # for a commit.
+  # controls last checked" needs a dated run without waiting for a commit.
   workflow_dispatch:
 
-# A force-push should not leave two runs racing to publish evidence for the same
-# ref; the newer one wins.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -39,16 +33,14 @@ permissions:
 
 jobs:
   supervisor:
-    name: Supervisor — lint, SAST, tests
+    name: Supervisor — lint, SAST, tests, library wheel
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          # The range `pyproject.toml` (`requires-python`) and the Model Serving
-          # image agree on. A newer interpreter here would test something the
-          # endpoint never runs.
+          # The floor `pyproject.toml` names and the Model Serving image agrees on.
           python-version: "3.11"
           cache: pip
 
@@ -56,7 +48,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           # requirements.txt is what ships inside the MLflow model artifact;
-          # requirements-dev.txt holds ruff and pytest and deliberately does not.
+          # requirements-dev.txt adds the shared library (editable) and tooling.
           pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Lint and SAST (ruff)
@@ -67,9 +59,13 @@ jobs:
       - name: Tests
         run: pytest -q --junitxml=pytest-results.xml
 
+      - name: Build the shared library wheel
+        # The same command `databricks bundle deploy` runs. A wheel that does
+        # not build here does not deploy.
+        run: python -m pip wheel --no-deps --wheel-dir libs/agent_governance/dist libs/agent_governance
+
       - name: Upload evidence
-        # `always()` so a *failing* run still produces its artifact. A pipeline
-        # that only keeps evidence when it passes is not evidence.
+        # `always()` so a *failing* run still produces its artifact.
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -77,29 +73,23 @@ jobs:
           path: |
             pytest-results.xml
             ruff-findings.json
+            libs/agent_governance/dist/*.whl
           retention-days: 90
           if-no-files-found: warn
 
   supply-chain:
     name: Supply chain — dependencies, secrets, SBOM
     runs-on: ubuntu-latest
-    # ASI04 (Agentic Supply Chain Vulnerabilities) asks for three things a
-    # lint-and-test pipeline has none of: a component inventory, integrity and
-    # vulnerability checking of what actually gets installed, and enforcement
-    # before deployment. `ruff --select S` says nothing about the dependency
-    # tree, which for an agent is most of the attack surface (langgraph,
-    # langchain, databricks-langchain, psycopg and their transitive closure).
-    #
+    # ASI04 asks for a component inventory, integrity and vulnerability checking
+    # of what actually gets installed, and enforcement before deployment.
     # `requirements.txt` is pinned exactly, so what this job resolves and what
-    # Model Serving installs are the same set — which is what makes the report
-    # a statement about production. Turning `continue-on-error` off makes this
-    # a release gate; it is left on until the client decides who triages a new
-    # advisory and on what clock.
+    # Model Serving installs are the same set. Turning `continue-on-error` off
+    # makes this a release gate; it is left on until the client decides who
+    # triages a new advisory and on what clock.
     steps:
       - uses: actions/checkout@v4
         with:
           # Full history so the secret scan can walk commits, not just the tip.
-          # A credential removed in a later commit is still a leaked credential.
           fetch-depth: 0
 
       - uses: actions/setup-python@v5
@@ -115,23 +105,16 @@ jobs:
 
       - name: Dependency vulnerabilities (pip-audit)
         # Reads the installed environment rather than the requirements file, so
-        # the report covers the transitive closure that actually ships inside
-        # the MLflow model artifact.
+        # the report covers the transitive closure that ships inside the model.
         continue-on-error: true
         run: |
           pip-audit --format=json --output=pip-audit.json || true
           pip-audit || true
 
       - name: Component inventory (CycloneDX SBOM)
-        # ASI04's "maintain a continuous inventory". CycloneDX rather than a
-        # plain freeze because it records hashes and licences, which is what
-        # makes provenance checkable later.
         run: cyclonedx-py environment --output-format JSON --outfile sbom.json
 
       - name: Secret scan (gitleaks)
-        # `.env` is gitignored and `.env.example` documents every variable —
-        # exactly the shape where a real value gets pasted into the example by
-        # accident.
         uses: gitleaks/gitleaks-action@v2
         continue-on-error: true
         env:

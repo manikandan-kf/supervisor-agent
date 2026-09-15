@@ -42,6 +42,9 @@ import uuid
 from typing import Generator
 
 import mlflow
+from agent_governance.locking import thread_lock
+from agent_governance.output_guard import OutputGuard, StreamGuard
+from agent_governance.sanitize import clean_inbound_text
 from mlflow.pyfunc import ResponsesAgent
 from mlflow.types.responses import (
     ResponsesAgentRequest,
@@ -51,9 +54,8 @@ from mlflow.types.responses import (
 
 from supervisor.context import SupervisorContext
 from supervisor.graph import build_graph
-from supervisor.locking import BUSY_MESSAGE, thread_lock
-from supervisor.output_guard import OutputGuard, StreamGuard
-from supervisor.sanitize import clean_inbound_text
+from supervisor.memory import lock_connection_source
+from supervisor.messages import BUSY_MESSAGE
 from supervisor.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -119,12 +121,20 @@ class SupervisorAgent(ResponsesAgent):
     # ── one execution per thread (§4.4) ─────────────────────────────────────
 
     def _lock(self, conversation_id: str):
-        """The execution lock for this turn's conversation. See locking.py."""
+        """The execution lock for this turn's conversation.
+
+        Model Serving runs several replicas and several worker processes each,
+        with no affinity by conversation, so nothing else stops two turns on
+        one thread racing each other's checkpoint. See
+        `agent_governance.locking` for the mechanism and where it degrades.
+        """
         return thread_lock(
             conversation_id,
+            connection_source=lock_connection_source(),
             enabled=self._settings.thread_lock_enabled,
             timeout=self._settings.thread_lock_timeout_seconds,
             poll=self._settings.thread_lock_poll_seconds,
+            namespace="supervisor",
         )
 
     def _busy(self, conversation_id: str) -> dict:
@@ -148,7 +158,7 @@ class SupervisorAgent(ResponsesAgent):
             logger.debug("busy-turn trace tagging skipped", exc_info=True)
         try:
             if self._audit is None:
-                from supervisor.audit import build_audit_logger
+                from supervisor.services import build_audit_logger
 
                 self._audit = build_audit_logger(self._settings)
             self._audit.log(

@@ -1,5 +1,5 @@
 import pytest
-from conftest import REGISTRY
+from helpers import REGISTRY
 
 from supervisor.guardrails import GuardrailEngine, GuardrailVerdict
 

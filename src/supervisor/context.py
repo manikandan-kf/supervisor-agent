@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from .trust import trust_secret, verify_entitlements
+from agent_governance.trust import trust_secret, verify_entitlements
 
 
 @dataclass(frozen=True)

@@ -22,15 +22,15 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
-import yaml
+from agent_governance.deny_rules import compile_rules, first_match, kill_switch_message
+from agent_governance.prompting import system_blocks, untrusted_turn
+from agent_governance.resilience import invoke_with_retries
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from .prompt_provider import get_prompt, system_blocks, untrusted_turn
-from .resilience import invoke_with_retries
+from .prompt_provider import get_prompt
 
 
 @dataclass(frozen=True)
@@ -491,29 +491,6 @@ def _asks(verdict: "GuardrailVerdict") -> str:
     return (verdict.clarification or "").strip() if verdict.underspecified else ""
 
 
-# Shown when the kill switch is engaged and the operator supplied no message of
-# their own. Worded as an operational hold, not a refusal — nothing was judged.
-KILL_SWITCH_MESSAGE = (
-    "The assistant is temporarily paused by the operations team. Nothing was sent "
-    "to an agent — please try again later."
-)
-
-
-def _kill_switch_message(declared) -> str:
-    """The operator's hold message, or "" when the switch is off.
-
-    Accepts the two shapes the governed document may carry — `kill_switch: true`
-    and `kill_switch: {enabled: true, message: "..."}` — so an emergency stop
-    can be one line in a publish. Anything else (absent, false, enabled: false)
-    means off, which is every existing document.
-    """
-    if declared is True:
-        return KILL_SWITCH_MESSAGE
-    if isinstance(declared, dict) and declared.get("enabled") is True:
-        return str(declared.get("message") or "").strip() or KILL_SWITCH_MESSAGE
-    return ""
-
-
 class GuardrailEngine:
     def __init__(
         self,
@@ -531,14 +508,7 @@ class GuardrailEngine:
         # registry entry names. None — every test and any direct caller —
         # means every verdict uses `llm`, exactly as before the seam existed.
         self._model_for = model_for
-        self._rules = [
-            (
-                re.compile(rule["pattern"]),
-                rule.get("reason", "matched a blocked pattern"),
-                rule.get("action") == "escalate",
-            )
-            for rule in (global_deny_patterns or [])
-        ]
+        self._rules = compile_rules(global_deny_patterns)
         self._threshold = confidence_threshold
         # ── Two thresholds, because "confident enough to act on" and "confident
         # enough to stop asking" are different questions ─────────────────────
@@ -569,27 +539,7 @@ class GuardrailEngine:
         # changes — so flipping the switch is a config publish that reaches a
         # running endpoint within the config cache TTL, not a redeploy. Empty
         # string means off; non-empty is the message the user is shown.
-        self.kill_switch_message = _kill_switch_message(kill_switch)
-
-    @classmethod
-    def from_yaml(
-        cls,
-        llm,
-        path: Path,
-        confidence_threshold: float = 0.7,
-        model_for=None,
-        decisive_threshold: float = 0.9,
-        contested_margin: float = 0.15,
-    ) -> "GuardrailEngine":
-        data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-        return cls.from_mapping(
-            llm,
-            data,
-            confidence_threshold,
-            model_for=model_for,
-            decisive_threshold=decisive_threshold,
-            contested_margin=contested_margin,
-        )
+        self.kill_switch_message = kill_switch_message(kill_switch)
 
     @classmethod
     def from_mapping(
@@ -601,7 +551,7 @@ class GuardrailEngine:
         decisive_threshold: float = 0.9,
         contested_margin: float = 0.15,
     ) -> "GuardrailEngine":
-        """Build from an already-parsed document (file or governed table)."""
+        """Build from the parsed guardrails document (`config.SupervisorConfig`)."""
         return cls(
             llm,
             (data or {}).get("global_deny_patterns", []),
@@ -621,10 +571,8 @@ class GuardrailEngine:
         than not offering — and it costs a regex sweep rather than a model call
         to avoid.
         """
-        for regex, reason, _escalate in self._rules:
-            if regex.search(query or ""):
-                return reason
-        return ""
+        rule = first_match(self._rules, query)
+        return rule.reason if rule else ""
 
     def screen(
         self,
@@ -657,11 +605,13 @@ class GuardrailEngine:
         # Global deterministic rules run once, before any agent is considered: a
         # blocked pattern must not become shoppable by retrying it against the
         # next agent in the list.
-        for regex, reason, escalate in self._rules:
-            if regex.search(query):
-                return ScreenResult(
-                    None, GuardrailResult(False, "deterministic", reason, escalate=escalate), ()
-                )
+        rule = first_match(self._rules, query)
+        if rule:
+            return ScreenResult(
+                None,
+                GuardrailResult(False, "deterministic", rule.reason, escalate=rule.escalate),
+                (),
+            )
 
         kind = small_talk_kind(query)
         if kind:

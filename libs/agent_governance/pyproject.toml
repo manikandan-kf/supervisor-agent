@@ -1,0 +1,42 @@
+# The governance primitives every agent on the platform shares — packaged as a
+# wheel so the supervisor and the worker agents (requirement, test-case, coding,
+# deployment) install one tested copy instead of vendoring a divergent one each.
+#
+#     pip install -e libs/agent_governance          # local development
+#     databricks bundle deploy -t dev               # builds the wheel (see databricks.yml)
+#
+# Floors rather than exact pins, deliberately: this is a library, and the
+# application that installs it (each agent's requirements.txt) owns the pins.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-governance"
+description = "Shared guardrail, security and audit primitives for the SDLC agent platform on Databricks."
+readme = "README.md"
+requires-python = ">=3.11"
+dynamic = ["version"]
+dependencies = [
+    # spend.py counts tokens with langchain's approximate counter.
+    "langchain-core>=1.0",
+    # config_store.py reads the bundled YAML seed documents.
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# audit.TracingAuditLogger mirrors a decision onto the active MLflow trace.
+tracing = ["mlflow>=3.0"]
+# lakebase.py — pooled Lakebase connections, the checkpointer and the store.
+lakebase = [
+    "databricks-langchain[memory]>=0.20",
+    "langgraph-checkpoint-postgres>=3.0",
+    "psycopg[binary]>=3.2",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "agent_governance.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

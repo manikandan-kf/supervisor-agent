@@ -1,4 +1,5 @@
-# Secrets — never commit. Copy .env.example to .env and fill it in locally.
+# Secrets — never commit. Local runs read a .env this file never tracks;
+# the deployed endpoint gets its variables from the bundle instead.
 .env
 
 # Python
@@ -24,3 +25,8 @@ mlflow.db
 .idea/
 Thumbs.db
 .DS_Store
+
+# Build output (the shared library wheel, built by `databricks bundle deploy`)
+dist/
+build/
+*.egg-info/

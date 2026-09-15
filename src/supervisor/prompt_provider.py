@@ -24,7 +24,7 @@ That distinction is load-bearing, and getting it wrong fails silently:
 
 A single-brace template therefore registers with no declared variables and, if
 anything ever called MLflow's `.format()` on it, would reach the model with
-literal placeholders. Any change to the templates in `scripts/register_prompts.py`
+literal placeholders. Any change to the templates registered by `deploy/register_prompts.py`
 has to hold that line — check `PromptVersion(...).variables` is non-empty.
 
 **On Databricks, prompts live in Unity Catalog.** Two more things follow, both
@@ -35,10 +35,9 @@ easy to miss because the failure is a silent fallback:
   * the name must be three-part, `catalog.schema.name`. A bare name is rejected
     by UC as invalid before any lookup happens.
 
-Register prompts with `scripts/register_prompts.py`, once per environment — each
-one keeps its prompts in its own Unity Catalog schema under its own alias.
-`scripts/verify_deployment.py` reports what is registered and what the endpoint
-actually loaded.
+Register prompts with `deploy/register_prompts.py`, once per environment — each
+one keeps its prompts in its own Unity Catalog schema under its own alias. The
+endpoint log says which source each prompt loaded from (DEPLOYMENT.md §8).
 """
 
 from __future__ import annotations
@@ -481,97 +480,6 @@ def get_prompt(name: str) -> str:
             ttl_seconds,
         )
         return default
-
-
-def untrusted_turn(**fields) -> str:
-    """JSON-encode untrusted content for its own user turn.
-
-    Two properties, both from Anthropic's prompt-injection guidance:
-
-      * **It is a separate message.** Concatenating user text into the same
-        block as the rules puts instructions and data on one footing; the rules
-        belong in the system turn and the data in a user turn, so the model has
-        a structural signal for which is which.
-      * **It is JSON, not tagged text.** XML delimiters are guessable and
-        escapable — a user who types `</user_query>` closes the tag and
-        everything after it reads as instructions. JSON escaping makes that
-        impossible: a quote or brace inside a value is encoded, so no value can
-        terminate its own field and break out into the surrounding structure.
-
-    `ensure_ascii=True` is deliberate. It escapes non-ASCII to \\uXXXX, which
-    also neutralises the homoglyph and bidi-override tricks used to smuggle
-    instructions past a reader's eye.
-    """
-    import json
-
-    return json.dumps(fields, ensure_ascii=True, default=str)
-
-
-# ── prompt caching ──────────────────────────────────────────────────────────
-#
-# Anthropic charges a cached prefix at ~10% of the input price on a read and
-# ~125% on the write, so caching a system prompt pays for itself from the second
-# use of that exact prefix within the TTL. The domain screen is the case that
-# benefits most, because it asks the same rules once *per candidate agent* — the
-# reuse happens inside a single turn, before any question of traffic.
-#
-# Verified against `databricks-claude-sonnet-4-5` rather than assumed, because
-# the public reports disagree: the Databricks docs say `cache_control` is
-# supported and a widely-cited community thread says it is rejected. What the
-# workspace actually does is create the cache (`cache_creation_input_tokens`)
-# and read it back (`cache_read_input_tokens`).
-#
-# One caveat worth knowing before trusting a dashboard: `ChatDatabricks` passes
-# `cache_control` through correctly but does **not** surface the two cache
-# counters in `response_metadata` — it reports only prompt/completion/total. So
-# caching cannot be confirmed from the LangChain response; it was confirmed by
-# priming through `ChatDatabricks` and reading the counters back with the raw
-# OpenAI-compatible client. Look in MLflow traces, not in our own usage numbers.
-_CACHE_MIN_TOKENS = 1024
-# Sonnet/Opus will not cache a block below `_CACHE_MIN_TOKENS`, and the failure
-# is silent — no error, no counters, just full price. Measured at ~4.12 chars
-# per token on these templates, so this is the character floor with a margin.
-# Keep the invariant half of a template well clear of it.
-_CACHE_MIN_CHARS = 4300
-
-
-def cacheable_split(template: str) -> tuple[str, str]:
-    """Split a single-brace template into (invariant prefix, per-call tail).
-
-    The boundary is the first `{`, which makes the property self-maintaining:
-    whatever an author writes *before* the first variable is the cached prefix.
-    Move a variable upwards and the prefix shrinks — below 1024 tokens it stops
-    being cached at all, silently, which is what the test guards.
-
-    This is also why the templates put their variables last. That ordering is
-    the documented shape for caching (static first, dynamic last) and costs the
-    prompt nothing: the model reads the rules, then the case to judge.
-    """
-    boundary = template.find("{")
-    if boundary == -1:
-        return template, ""
-    return template[:boundary], template[boundary:]
-
-
-def system_blocks(template: str, **values) -> list[dict] | str:
-    """The system turn for a governance call, as cacheable content blocks.
-
-    Returns a plain string when the invariant prefix is too short to cache —
-    there is no point paying the 25% write premium for a block the API will
-    refuse to store, and a string keeps the request identical to what it was.
-
-    The tail is interpolated and sent uncached on every call. That includes the
-    untrusted-content policy, which stays *after* the per-agent lines on
-    purpose: it is the instruction most worth having last, and it is small.
-    """
-    prefix, tail = cacheable_split(template)
-    body = tail.format(**values) if tail else ""
-    if len(prefix) < _CACHE_MIN_CHARS:
-        return prefix + body
-    return [
-        {"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}},
-        {"type": "text", "text": body},
-    ]
 
 
 def bundled_default(name: str) -> str:
