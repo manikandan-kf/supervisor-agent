@@ -40,7 +40,7 @@ jobs:
     name: Supervisor — lint, SAST, tests, library wheel
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
@@ -108,7 +108,7 @@ jobs:
     # makes this a release gate; it is left on until the client decides who
     # triages a new advisory and on what clock.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history so the secret scan can walk commits, not just the tip.
           fetch-depth: 0
