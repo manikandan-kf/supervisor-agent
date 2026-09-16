@@ -42,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           # The floor `pyproject.toml` names and the Model Serving image agrees on.
           python-version: "3.11"
@@ -113,7 +113,7 @@ jobs:
           # Full history so the secret scan can walk commits, not just the tip.
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
