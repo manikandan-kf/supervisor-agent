@@ -14,3 +14,12 @@ ruff==0.14.6
 # Both test trees. Everything runs offline — no workspace, no network, no
 # database — so `pytest` needs nothing configured first.
 pytest==9.1.1
+
+# Static types. Gated in CI on the shared library, reported on the supervisor
+# package — see [tool.mypy] in pyproject.toml for why the two differ.
+mypy==1.18.2
+types-PyYAML==6.0.12.20250915
+
+# Coverage, reported in CI. No threshold is enforced yet: the number has to be
+# visible before it can be argued about.
+pytest-cov==7.0.0

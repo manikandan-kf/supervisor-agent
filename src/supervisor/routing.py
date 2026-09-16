@@ -11,8 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from agent_governance.prompting import untrusted_turn
 from agent_governance.resilience import invoke_with_retries
+from agent_governance.sanitize import untrusted_turn
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
@@ -24,15 +24,11 @@ class RouteResult:
     ready: bool
     resolved_context: dict[str, str] = field(default_factory=dict)
     clarifying_question: Optional[str] = None
-    # Context keys carried in from an earlier turn or an earlier conversation
-    # that this request is *not* about, and which were therefore dropped rather
-    # than dispatched on. Kept on the result so the decision trail records the
-    # drop: context silently surviving a change of subject and context silently
-    # vanishing are both wrong, and only one of them is visible without this.
+    # Carried-in context this request is *not* about, dropped rather than dispatched on. On
+    # the result so the trail records the drop — a silent vanish is otherwise invisible.
     dropped_context: tuple[str, ...] = ()
-    # False when the request does not depend on the agent's required context at
-    # all. Kept on the result so the decision trail records *why* nothing was
-    # asked, rather than leaving a silent pass-through (BR-004).
+    # False when the request does not depend on the required context at all. On the result
+    # so the trail records *why* nothing was asked (BR-004).
     context_applies: bool = True
 
 
@@ -44,10 +40,8 @@ class _ContextItem(BaseModel):
 class RouteDecision(BaseModel):
     """Structured output contract for the routing stage.
 
-    Public because it is part of the prompt's registered surface:
-    `register_prompts.py` binds it to `supervisor_routing` as the version's
-    `response_format`, so the schema the model is held to ships with the same
-    immutable prompt version that instructs it.
+    Public because `register_prompts.py` binds it to `supervisor_routing` as the version's
+    `response_format`, so the schema ships with the same immutable prompt version.
     """
 
     context_applies: bool = Field(
@@ -58,18 +52,9 @@ class RouteDecision(BaseModel):
             "artifact rather than change it. This is the common case: proceed"
         ),
     )
-    # Asked before `ready`, and before anything else that could be answered
-    # *from* the carried context — the order is the same load-bearing trick the
-    # domain screen uses. A model that has already listed a product line as
-    # resolved will not then decide the request was never about it.
-    #
-    # This is the fix for context outliving its subject. `known_context` holds
-    # values resolved on earlier turns and, for a brand-new conversation, the
-    # user's most recent values read back from long-term memory. Applied
-    # unconditionally, that is how a fresh question about a different feature
-    # gets answered in terms of the last one — the user starts what they think
-    # is a clean conversation and the previous one's subject follows them into
-    # it, with nothing in the transcript to say why.
+    # Asked before `ready` — the same load-bearing ordering trick as the domain screen: a
+    # model that has already listed a value as resolved will not then decide the request was
+    # never about it. This is the fix for context outliving its subject across conversations.
     prior_context_applies: bool = Field(
         default=True,
         description=(
@@ -99,10 +84,8 @@ _PROMPT_NAME = "supervisor_routing"
 class Router:
     def __init__(self, llm, model_for=None):
         self._llm = llm
-        # Multi-model support: optional `agent -> chat model`
-        # resolver, so context resolution for an agent runs on the model its
-        # registry entry names. None (tests, direct callers) keeps every call
-        # on `llm`, unchanged.
+        # Optional `agent -> chat model` resolver so context resolution runs on the model the
+        # agent's registry entry names. None (tests, direct callers) keeps every call on `llm`.
         self._model_for = model_for
 
     def resolve(
@@ -115,11 +98,9 @@ class Router:
     ) -> RouteResult:
         """Resolve the agent's required context, or ask for what is missing.
 
-        `deadline` is the turn's remaining time budget (§05 Stage 05). Checked
-        before the model call and only when a call is actually needed — an agent
-        with no `required_context` returns without spending anything, so an
-        exhausted budget must not turn that free path into a failure. None
-        disables the check.
+        `deadline` (§05 Stage 05) is checked only when a model call is actually needed: an
+        agent with no `required_context` returns for free, and an exhausted budget must not
+        turn that free path into a failure. None disables the check.
         """
         if not agent.required_context:
             return RouteResult(True, dict(prior_context))
@@ -128,21 +109,16 @@ class Router:
         if deadline is not None:
             deadline.ensure(f"resolving context for {agent.id}")
 
-        # Rules in the system turn, untrusted content in a JSON user turn.
-        # `prior` is read back from long-term memory, which is user-influenced,
-        # so it belongs on the untrusted side of that line too.
+        # Rules in the system turn, untrusted content in a JSON user turn. `prior` is read
+        # back from long-term memory, which is user-influenced, so it is untrusted too.
         rules = get_prompt(_PROMPT_NAME).format(
             agent_name=agent.name,
             description=agent.description,
             required=", ".join(agent.required_context) or "(none)",
         )
-        # `carried_over` is named separately from the rest of `known_context`
-        # because the two carry different weight. A value the user stated in
-        # *this* conversation is something they can see in the transcript above
-        # them; a value read back from another conversation is not, and applying
-        # it silently is what makes an answer look like it belongs to a
-        # different session. Naming it lets the model — and the audit row — tell
-        # them apart.
+        # `carried_over` is named separately because it carries different weight: a value the
+        # user stated in *this* conversation is visible in their transcript; one read back from
+        # another conversation is not, and the model and audit row need to tell them apart.
         payload = untrusted_turn(
             known_context=dict(prior_context),
             carried_over_from_earlier=carried_over,
@@ -169,19 +145,9 @@ class Router:
         context = base
         context.update({item.key: item.value for item in decision.resolved_context})
 
-        # `required_context` describes what the agent needs to *produce an
-        # artifact*, not a toll on every message. Asking "which product line?"
-        # before answering "what is an epic?" is noise, and after two of them
-        # the user is escalated to a human for no reason.
-        #
-        # The bar was raised deliberately after watching a real session: a user
-        # asked for user stories about a password reset and was asked which
-        # product line it was for — a question whose answer would have decorated
-        # the stories, not changed them. The design scopes clarification to
-        # context that "is ambiguous", which is narrower than context that is
-        # merely absent, and the prompt now tests for exactly that: ask when the
-        # conversation puts several candidates in play, or when a wrong guess
-        # would do real damage; otherwise proceed with what is known.
+        # `required_context` is what the agent needs to *produce an artifact*, not a toll on
+        # every message: clarification is scoped to context that "is ambiguous", narrower than
+        # merely absent — a wrong guess has to do real damage before the user is asked.
         if not decision.context_applies:
             return RouteResult(True, context, context_applies=False, dropped_context=dropped)
 

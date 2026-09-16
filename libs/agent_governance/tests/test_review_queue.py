@@ -164,8 +164,14 @@ def test_list_open_is_the_reviewers_working_set():
 
 
 def test_grants_retry_and_public_shape():
-    review = Review(ref="rev_1", kind=APPEAL, status=RESOLVED, conversation_id="thr_1",
-                    decision=ALLOW_RETRY, user_key="usr_1")
+    review = Review(
+        ref="rev_1",
+        kind=APPEAL,
+        status=RESOLVED,
+        conversation_id="thr_1",
+        decision=ALLOW_RETRY,
+        user_key="usr_1",
+    )
     assert review.grants_retry
     assert review.public()["user_reference"] == "usr_1"
     assert "user_key" not in review.public()

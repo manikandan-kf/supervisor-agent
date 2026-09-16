@@ -1,15 +1,10 @@
 """Which environment a process runs in, and what that permits.
 
-`ENVIRONMENT` answers two different questions, and conflating them is a bug:
-
-  1. *Which* deployment is this? It selects the prompt alias, the Unity Catalog
-     schema and the Lakebase schema. Every deployed environment has its own.
-  2. *May a control degrade here?* Only on a workstation or in CI.
-
-A dev deployment is a deployment: it has a real store and the same failsafe
-doctrine as prod. So the degradation set is the *local* one and `dev` is not in
-it. A workstation run is `ENVIRONMENT=local`; a test runner leaves the variable
-unset, which is the empty string below.
+`ENVIRONMENT` answers two questions, and conflating them is a bug: *which* deployment is this
+(prompt alias, UC schema, Lakebase schema), and *may a control degrade here* (only on a
+workstation or in CI). A dev deployment is a deployment with a real store and prod's failsafe
+doctrine, so `dev` is not in the local set; a workstation is `ENVIRONMENT=local` and a test
+runner leaves it unset (the empty string).
 """
 
 from __future__ import annotations
@@ -20,10 +15,8 @@ LOCAL_ENVIRONMENTS = frozenset({"local", "test", "testing", ""})
 
 DEFAULT_CATALOG = "workspace"
 
-# Which deployed environment a *workstation* run addresses. A local process has
-# no resources of its own, so it borrows a deployed environment's — dev.
-# A constant rather than a variable on purpose: pointing a lenient process at
-# prod's tables should take a deliberate override of each name, not one edit.
+# A workstation run borrows a deployed environment's resources — dev. A constant on purpose:
+# aiming a lenient process at prod must take a deliberate override of each name, not one edit.
 LOCAL_READS = "dev"
 
 

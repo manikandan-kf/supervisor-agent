@@ -1,54 +1,11 @@
 """Sensitive-data detection catalogue — the shapes the guardrail layer recognises.
 
-One place, deliberately, for every pattern an agent treats as sensitive:
-`redact_text` below (the persistence redactor) and `output_guard.py` (the
-layer-7 output screen) both read this catalogue, so a shape added here is
-masked in the audit sinks, in the text relayed to a worker, and in the reply on
-its way back — three boundaries, one definition.
-
-Without one place the recognised shapes drift towards whatever was easy to
-write, which is two families: known credential token shapes and email
-addresses. Names, phone numbers, government identifiers, payment cards, bank
-accounts, health identifiers, dates of birth, internal hostnames and server
-paths then pass through untouched, and "block" is unreachable because nothing
-classifies a finding. This module is the catalogue half of the layer-7 screen;
-the tiering half is `output_guard.OutputPolicy`.
-
-Design rules, grounded in what the vendors and the research actually publish:
-
-* **Every finding carries a category.** The category is what the policy acts
-  on (mask / block / escalate); the label is what the reader sees in the
-  placeholder. Categories mirror the sensitivity tiers Google DLP, AWS Bedrock
-  Guardrails and Databricks `detect_sensitive_data` agree on: credentials,
-  national identifiers, payment and bank data and health identifiers are the
-  high tier; names, contact details, dates of birth and network detail are the
-  moderate tier.
-* **Checksums and structure over bare regexes.** Card numbers must pass Luhn
-  (Presidio `CreditCardRecognizer`), IBANs must pass mod-97 and match their
-  country's length, NHS numbers must pass mod-11, US SSNs must not use an
-  impossible area/group/serial. A bare digit run is not evidence.
-* **Context words gate the ambiguous shapes.** A ten-digit number is a
-  timestamp until the word "NHS" sits beside it; a date is a release date until
-  "DOB" does. This is Presidio's context-enhancer idea applied deterministically:
-  weak shapes require a keyword within a short window, strong shapes do not.
-* **Names are anchored, not guessed.** No regex recognises a person's name in
-  free text — that is an NER problem, and Presidio's answer is a spaCy model.
-  What a regex *can* do with high precision is catch a name introduced by a
-  role word ("patient Sarah Kim", "customer: Jane Whitfield", "name John
-  Mercer"), which is how names arrive in test fixtures and requirement
-  excerpts. Unanchored names are the recorded residual; the upgrade path is
-  Presidio's NER recognizer in-container.
-* **Precision over recall, still.** Every pattern here is tuned against the
-  SDLC prose this system carries — user stories, HLDs, test cases, YAML,
-  stack traces — and a false positive costs a reader a placeholder in a
-  document they were meant to read. The stoplists and validators exist for
-  that reason.
-
-Sources: OWASP LLM02:2025 (sensitive information disclosure — sanitisation,
-tokenisation and redaction), Microsoft Presidio predefined recognizers (SSN,
-credit card + Luhn, IBAN + mod-97, UK NINO, date, IP, URL), gitleaks and
-detect-secrets credential rules, Google Cloud DLP infoType sensitivity levels,
-AWS Bedrock Guardrails PII entity list, PCI DSS truncation guidance.
+One definition read by `redact_text` (persistence) and `output_guard.py` (layer-7 screen), so
+a shape added here is masked at every boundary; tiering lives in `output_guard.OutputPolicy`.
+Rules: every finding carries a category (what the policy acts on); checksums and context words
+gate ambiguous digit runs; names match only when a role word anchors them (unanchored names are
+the recorded residual); precision over recall — a false positive costs a reader a placeholder.
+Sources: OWASP LLM02:2025, Presidio, gitleaks, detect-secrets, Google DLP, AWS Bedrock, PCI DSS.
 """
 
 from __future__ import annotations
@@ -87,29 +44,18 @@ CATEGORIES: tuple[str, ...] = (
     NETWORK,
 )
 
-# The categories the vendors put in the high tier: values that may never be
-# delivered raw whatever the local policy says. `config_store` refuses a
-# published policy that sets any of these to `allow`.
+# The vendors' high tier: never delivered raw whatever the local policy says.
+# `config_store` refuses a published policy that sets any of these to `allow`.
 NEVER_ALLOW: frozenset[str] = frozenset(
     {CREDENTIAL, SECRET_ASSIGNMENT, GOVERNMENT_ID, PAYMENT, BANK, HEALTH_ID}
 )
 
-# The "PII tier" — what OUTPUT_PII_MASKING switches. Everything else is masked
-# regardless, because a token, a card number or an internal hostname is a leak
-# whatever the artifact, while a stakeholder's name inside a drafted HLD may be
-# the content.
+# The "PII tier" — what OUTPUT_PII_MASKING switches. Everything else is masked regardless: a
+# token is a leak in any artifact, while a stakeholder's name inside a drafted HLD may be content.
 PII_TIER: frozenset[str] = frozenset({PERSON, CONTACT, DOB, HEALTH_CONDITION})
 
-# The categories that count towards the bulk-disclosure threshold. A response
-# carrying five card numbers or five secret values is a different event from
-# one carrying five email addresses: the first is a data dump, the second is a
-# distribution list.
-#
-# The same set as `NEVER_ALLOW`, and deliberately defined as one: "high tier"
-# has to mean one thing. They were briefly different — `secret_assignment`
-# counted toward a bulk disclosure but could still be published as `allow` —
-# which meant the guardrails document's own description of the high tier and
-# the code's enforcement of it disagreed.
+# Counts towards the bulk-disclosure threshold: five card numbers are a data dump, five
+# emails a distribution list. Defined as `NEVER_ALLOW` itself so "high tier" means one thing.
 BULK_CATEGORIES: frozenset[str] = NEVER_ALLOW
 
 
@@ -129,11 +75,8 @@ _TIER_RANK: dict[str, int] = {
 class Finding:
     """One sensitive value located in a text.
 
-    `label`/`category` are the *strongest* classification in the span; `labels`
-    and `categories` list everything that matched inside it. The distinction
-    matters because overlapping matches are merged rather than resolved (see
-    `scan`): a span that is both a secret assignment and a URL credential is
-    one finding, acted on as a credential, recorded as both.
+    `label`/`category` are the strongest classification in the span; `labels`/`categories`
+    list everything that matched, because overlapping matches are merged, not resolved (`scan`).
     """
 
     label: str
@@ -149,13 +92,8 @@ class Finding:
         return f"[redacted:{self.label}]"
 
 
-#: A placeholder this module already wrote. Nothing inside one is ever a
-#: finding: `[redacted:url-credentials]` contains a colon, so the
-#: `scheme://user:pass@host` shape matched the placeholder itself on a second
-#: pass — inflating the masked count, nesting placeholders, and making the
-#: sweep in `redact` non-idempotent. Excluding these spans is what makes
-#: re-screening already-masked text a genuine no-op rather than a coincidence
-#: of which shapes happen not to match their own output.
+#: A placeholder this module already wrote. Nothing inside one is ever a finding (the
+#: `url-credentials` shape matches the placeholder itself), so a second pass is a genuine no-op.
 _PLACEHOLDER = re.compile(r"\[redacted:[a-z0-9-]+\]")
 
 
@@ -165,11 +103,8 @@ _PLACEHOLDER = re.compile(r"\[redacted:[a-z0-9-]+\]")
 def luhn_valid(digits: str) -> bool:
     """The Luhn checksum every payment card number satisfies (ISO/IEC 7812).
 
-    ASCII-only on purpose: `\\D` would keep an Arabic-Indic or full-width digit
-    and `ord(char) - 48` would then compute nonsense from it. Non-ASCII digits
-    never reach here anyway — `scan` folds them to ASCII before matching (see
-    `_fold`), which is what stops `4242 4242 4242 ٤٢٤٢` from evading the shape
-    entirely rather than merely failing the checksum.
+    ASCII-only on purpose: `\\D` would keep a non-ASCII digit and `ord(char) - 48` would
+    compute nonsense from it. `scan` folds such digits before they reach here anyway.
     """
     digits = re.sub(r"[^0-9]", "", digits)
     if not 13 <= len(digits) <= 19:
@@ -185,10 +120,8 @@ def luhn_valid(digits: str) -> bool:
     return total % 10 == 0
 
 
-# Country -> IBAN length, ISO 13616 registry (the entries that matter for an
-# SDLC platform's likely traffic; an unknown country is refused rather than
-# guessed, which is the fail-closed direction for a *detector*... except that
-# refusing means *not masking*, so the table is kept deliberately broad).
+# Country -> IBAN length, ISO 13616 registry. Deliberately broad: an unknown country means
+# *not masking*, so a narrow table fails in the unsafe direction for a detector.
 _IBAN_LENGTHS = {
     "AD": 24, "AE": 23, "AL": 28, "AT": 20, "AZ": 28, "BA": 20, "BE": 16, "BG": 22,
     "BH": 22, "BR": 29, "BY": 28, "CH": 21, "CR": 22, "CY": 28, "CZ": 24, "DE": 22,
@@ -216,9 +149,8 @@ def iban_valid(candidate: str) -> bool:
 def ssn_valid(candidate: str) -> bool:
     """SSA issuance rules: no 000/666/9xx area, no 00 group, no 0000 serial.
 
-    Presidio additionally refuses the published sample numbers (123-45-6789
-    among them). Deliberately not done here: over-masking a sample costs
-    nothing, and sample numbers are exactly what a test fixture carries.
+    Presidio also refuses the published sample numbers; deliberately not done here, since
+    over-masking a sample costs nothing and sample numbers are what test fixtures carry.
     """
     digits = re.sub(r"\D", "", candidate)
     if len(digits) != 9:
@@ -268,22 +200,8 @@ def _has_context(text: str, start: int, end: int, words: re.Pattern[str], window
 
 # ── digit and width folding ─────────────────────────────────────────────────
 #
-# Every pattern here is ASCII, and a detector that only reads ASCII is evaded
-# by writing the same value in another script: `4242 4242 4242 ٤٢٤٢` matched no
-# payment shape at all, so it was neither blocked nor masked. Folding is
-# **length-preserving** — one codepoint in, one codepoint out — which is what
-# lets `scan` match against the folded text while every offset, slice and
-# replacement still refers to the original. Anything that changed length here
-# would silently misplace a mask.
-#
-# Two families, both confirmed evasions and both single-codepoint:
-#   * Unicode decimal digits (Arabic-Indic, Devanagari, full-width, …) → 0-9
-#   * Full-width ASCII forms (U+FF01–U+FF5E) → their ASCII equivalents
-#
-# Not attempted: general homoglyph normalisation (Cyrillic а for Latin a and
-# the rest of that long tail). It needs a confusables table, it is not
-# length-preserving in every case, and it is the documented residual — the
-# gateway's boundary classification is the layer for it.
+# Every pattern is ASCII, so non-ASCII digits evaded them all. Folding is length-preserving, so
+# spans still index the original; homoglyphs (Cyrillic а for a) are the documented residual.
 def _build_fold() -> dict[int, int]:
     table: dict[int, int] = {}
     for codepoint in range(0x0000, 0x1E950 + 10):
@@ -318,8 +236,7 @@ class Shape:
     label: str
     category: str
     pattern: re.Pattern[str]
-    # Which group holds the sensitive value (0 = the whole match). Lets a
-    # pattern keep its evidence — `DB_PASSWORD=` survives, the value goes.
+    # Which group holds the value (0 = whole match), so evidence like `DB_PASSWORD=` survives.
     group: int = 0
     # Extra acceptance test on the matched value (checksum, issuance rules).
     validate: Optional[Callable[[str], bool]] = None
@@ -333,10 +250,8 @@ def _ci(pattern: str) -> re.Pattern[str]:
     return re.compile(pattern, re.IGNORECASE)
 
 
-# Words that, capitalised, follow "user"/"customer"/"patient" in ordinary SDLC
-# prose and are not surnames. A candidate name containing any of them is not a
-# name. Deliberately generous: a missed name is masked at the next boundary,
-# a mangled heading in an HLD is a reader who stops trusting the redactor.
+# Capitalised words after "user"/"customer"/"patient" in SDLC prose that are not surnames. Generous
+# on purpose: a missed name is masked at the next boundary; a mangled HLD heading loses the reader.
 _NAME_STOPWORDS = frozenset(
     """
     story stories journey journeys interface experience acceptance testing test tests
@@ -364,12 +279,8 @@ def _not_a_stopword_name(value: str) -> bool:
 
 # ── internal hostnames ──────────────────────────────────────────────────────
 #
-# The suffixes that mean "this name does not resolve on the public internet".
-# Deliberately *not* including bare `local`, `lan` or `svc`: `.local` is both
-# mDNS and a widespread filename convention (`.env.local`,
-# `docker-compose.local`, `settings.local.json`), and masking those mangles
-# ordinary developer prose for no gain. A real internal name such as
-# `auth-internal.prod.svc.cluster.local` is still caught by `cluster.local`.
+# Suffixes meaning "does not resolve on the public internet". Not bare `local`/`lan`/`svc`:
+# `.local` is also a filename convention (`.env.local`); `x.svc.cluster.local` is still caught.
 _INTERNAL_SUFFIXES = (
     "svc.cluster.local",
     "cluster.local",
@@ -389,16 +300,8 @@ _PUBLIC_HOSTS = ("localhost", "example.com", "example.org", "example.net", "inva
 def _is_internal_host(value: str) -> bool:
     """Whether a dotted name names something inside a private network.
 
-    This is the *validator* half of the `internal-hostname` shape, and the
-    reason the shape's regex is a single flat character class: the previous
-    pattern expressed the label structure with two adjacent, mutually ambiguous
-    label stars around an optional middle group, which is a cubic-backtracking
-    shape. `"corp."` repeated to the 8000-character input limit took **353
-    seconds** inside one node — an uninterruptible denial of service reachable
-    from one ordinary-looking message, since the regex is C-level, the deadline
-    is only checked *between* calls, and the conversation lock is held
-    throughout. Structure that a validator can check in linear time does not
-    belong in a regex.
+    The validator half of `internal-hostname`, and why its regex is one flat class: the nested
+    label-star form backtracked cubically — 353 s on one 8000-char message, holding the turn lock.
     """
     host = value.split(":", 1)[0].rstrip(".").lower()
     if not host or "." not in host:
@@ -413,13 +316,8 @@ def _is_internal_host(value: str) -> bool:
     return any(host.endswith(suffix) for suffix in _INTERNAL_SUFFIXES)
 
 
-# Values that are a *reference* to a secret rather than one: a template
-# variable, an environment interpolation, an angle-bracket placeholder, or the
-# name of an auth scheme. Masking these is pure noise — `auth: bearer` in an
-# OpenAPI security scheme and `password: ${DB_PASSWORD}` in a compose file are
-# both documents a reader was meant to read. A *generic-looking but literal*
-# value stays masked: `DB_PASSWORD=changeme123` is still a credential, and a
-# credential is not made safe by resembling a placeholder.
+# A *reference* to a secret rather than one — template variable, env interpolation, placeholder,
+# auth scheme name. Masking `password: ${DB_PASSWORD}` is noise; a literal value stays masked.
 _SECRET_REFERENCE = re.compile(
     r"^(?:\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|%[A-Za-z_][A-Za-z0-9_]*%|\{\{[^}]*\}\}|"
     r"<[^>]*>|\[[^\]]*\]|bearer|basic|digest|negotiate|none|null|true|false|required|optional|"
@@ -435,10 +333,8 @@ def _is_real_secret_value(value: str) -> bool:
 def _identifier_with_a_digit(value: str) -> bool:
     """A record identifier has a digit in it; a schema word does not.
 
-    `patient id: field` and `patient number: auto-increment` are an intake form
-    and a column definition — the everyday output of a healthcare SDLC
-    assistant, and `health_id` is a *withhold* tier, so matching them turned an
-    artifact into a refusal.
+    `patient id: field` and `patient number: auto-increment` are ordinary SDLC output, and
+    `health_id` is a withhold tier, so matching them turned an artifact into a refusal.
     """
     return any(char.isdigit() for char in value)
 
@@ -461,10 +357,8 @@ SHAPES: tuple[Shape, ...] = (
         CREDENTIAL,
         re.compile(r"\b(?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b"),
     ),
-    # The 40-character secret that travels with an AWS key id. Bare 40-char
-    # base64 runs are far too common in SDLC text (git SHAs are 40 hex), so
-    # the shape is gated on an AWS/secret keyword nearby — the detect-secrets
-    # and AWS Security Blog construction.
+    # The 40-char secret that travels with an AWS key id. Bare 40-char base64 runs are common in
+    # SDLC text (git SHAs), so the shape is keyword-gated — the detect-secrets construction.
     Shape(
         "aws-secret-key",
         CREDENTIAL,
@@ -485,7 +379,9 @@ SHAPES: tuple[Shape, ...] = (
     Shape(
         "azure-client-secret",
         CREDENTIAL,
-        re.compile(r"(?<![A-Za-z0-9_~.-])[a-zA-Z0-9_~.]{3}\dQ~[a-zA-Z0-9_~.-]{31,34}(?![A-Za-z0-9_~.-])"),
+        re.compile(
+            r"(?<![A-Za-z0-9_~.-])[a-zA-Z0-9_~.]{3}\dQ~[a-zA-Z0-9_~.-]{31,34}(?![A-Za-z0-9_~.-])"
+        ),
     ),
     Shape(
         "jwt",
@@ -502,15 +398,8 @@ SHAPES: tuple[Shape, ...] = (
         group=1,
     ),
     # ── secret assignments (mask tier) ──────────────────────────────────
-    # KEY = value where the key names a secret. The key survives, the value
-    # goes. Admits prefixed keys (`DB_PASSWORD`, `app.secret`). The value must
-    # not already be a placeholder, so a second pass is a no-op rather than a
-    # double count.
-    # `[A-Za-z0-9_.-]{0,40}` rather than `(?:[A-Za-z0-9]+[_.-])*` for the key
-    # prefix. The star-of-plus form backtracks per iteration — quadratic, 24.6
-    # seconds on a 24000-character worker reply of `a-a-a-…`, which is inside
-    # the response size limit. A bounded flat class admits the same prefixed
-    # keys (`DB_PASSWORD`, `app.secret`) in linear time.
+    # KEY = value where the key names a secret; the key survives, the value goes. Bounded flat
+    # prefix class, not a star-of-plus: that form backtracked 24.6 s on a 24000-char reply.
     Shape(
         "secret-assignment",
         SECRET_ASSIGNMENT,
@@ -518,16 +407,15 @@ SHAPES: tuple[Shape, ...] = (
             r"(?i)(?<![A-Za-z0-9_.-])[A-Za-z0-9_.-]{0,40}"
             r"(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|"
             r"client[_-]?secret|private[_-]?key|auth)[A-Za-z0-9_-]{0,30}"
-            r"\s*[:=]\s*['\"]?(?!\[redacted:)([^\s'\";,]{6,})['\"]?"
+            # `['\"]?` before the separator as well as after: in JSON the key's own closing quote
+            # sits between them (`"DB_PASSWORD": "…"`). Same fix as the `person` shape below.
+            r"['\"]?\s*[:=]\s*['\"]?(?!\[redacted:)([^\s'\";,]{6,})['\"]?"
         ),
         group=1,
         validate=_is_real_secret_value,
     ),
-    # A secret handed over in prose — "the token dGVzdC1z... is invalid". No
-    # `=` or `:` for the assignment rule to key on, so the value is recognised
-    # by shape instead: sixteen or more token characters carrying at least one
-    # digit or base64 symbol, introduced by a secret noun. Mask tier because
-    # the confidence is lower than a typed credential's.
+    # A secret handed over in prose ("the token … is invalid") has no `=`/`:` to key on, so it is
+    # matched by shape: 16+ token chars carrying a digit or base64 symbol after a secret noun.
     Shape(
         "prose-secret",
         SECRET_ASSIGNMENT,
@@ -579,28 +467,34 @@ SHAPES: tuple[Shape, ...] = (
     Shape(
         "card-cvv",
         PAYMENT,
-        re.compile(r"(?i)\b(?:cvv|cvc|cvv2|cvc2|security\s+code|card\s+code)\s*[:=#]?\s*(\d{3,4})\b"),
+        re.compile(
+            r"(?i)\b(?:cvv|cvc|cvv2|cvc2|security\s+code|card\s+code)\s*[:=#]?\s*(\d{3,4})\b"
+        ),
         group=1,
     ),
     Shape(
         "card-expiry",
         PAYMENT,
-        re.compile(r"(?i)\b(?:exp(?:iry|iration|ires)?(?:\s+date|\s+month)?)\s*[:=]?\s*((?:0[1-9]|1[0-2])\s?/\s?(?:\d{2}|\d{4}))\b"),
+        re.compile(
+            r"(?i)\b(?:exp(?:iry|iration|ires)?(?:\s+date|\s+month)?)\s*[:=]?\s*((?:0[1-9]|1[0-2])\s?/\s?(?:\d{2}|\d{4}))\b"
+        ),
         group=1,
         context=_ci(r"card|pan|visa|mastercard|amex|payment"),
         window=120,
     ),
-    # "last 4 digits: 4242" — the partial-extraction pattern. PCI DSS allows
-    # last-four *display* where a business function needs it; a response that
-    # volunteers it next to card context is the semantic-leakage case this
-    # shape exists for, and the point of a fragment is that a full-number
-    # regex never sees it.
+    # PCI DSS allows last-four *display* for a business function; a reply that volunteers it
+    # next to card context is the semantic leak this shape exists for — no full number to match.
     Shape(
         "card-fragment",
         PAYMENT,
-        re.compile(r"(?i)\b(?:last|first)\s+(?:4|four|6|six)\s+digits?\b[^\n:]{0,20}[:=]?\s*(\d{4,6})\b"),
+        # `expir`/`cvv`/`cardholder` are in the gate because the natural answer repeats no
+        # payment noun — the *question* established it. Do NOT widen the `{0,20}` gap to reach
+        # more: `_has_context` looks either side of the match, so a wider gap eats the keyword.
+        re.compile(
+            r"(?i)\b(?:last|first)\s+(?:4|four|6|six)\s+digits?\b[^\n:]{0,20}[:=]?\s*(\d{4,6})\b"
+        ),
         group=1,
-        context=_ci(r"card|pan|visa|mastercard|amex|payment|account"),
+        context=_ci(r"card|pan|visa|mastercard|amex|payment|account|expir|cvv|cvc|cardholder"),
         window=160,
     ),
     # ── bank (block tier) ───────────────────────────────────────────────
@@ -610,10 +504,8 @@ SHAPES: tuple[Shape, ...] = (
         re.compile(r"\b[A-Z]{2}\d{2}(?:[ -]?[A-Z0-9]{4}){2,7}(?:[ -]?[A-Z0-9]{1,4})?\b"),
         validate=iban_valid,
     ),
-    # `account` alone is not the keyword — "Given the account: 10203040 has a
-    # payment pending" is a Gherkin scenario, and `bank` is a *withhold* tier.
-    # The keyword has to name the *number*: "account number", "acct", or a
-    # routing/sort-code/SWIFT identifier.
+    # `account` alone is not the keyword: "Given the account: 10203040" is a Gherkin scenario
+    # and `bank` is a withhold tier. The keyword must name the *number* — "account number", etc.
     Shape(
         "bank-account",
         BANK,
@@ -627,14 +519,14 @@ SHAPES: tuple[Shape, ...] = (
         window=80,
     ),
     # ── health identifiers (block tier) ─────────────────────────────────
-    # The value must carry a digit. Without that, `patient id: field` (an
-    # intake-form requirement) and `patient number: auto-increment` (a column
-    # definition) matched a *withhold*-tier shape, so a healthcare assistant's
-    # ordinary output came back as a refusal.
+    # The value must carry a digit: without it `patient id: field` and `patient number:
+    # auto-increment` matched a withhold-tier shape, refusing ordinary healthcare output.
     Shape(
         "medical-record-number",
         HEALTH_ID,
-        re.compile(r"(?i)\b(?:mrn|medical\s+record\s+(?:number|no|id|#)|patient\s+(?:id|number|no|#)|health\s+(?:record|card|insurance)\s+(?:number|no|id))\s*[:=#-]?\s*([A-Za-z0-9][A-Za-z0-9-]{3,20})\b"),
+        re.compile(
+            r"(?i)\b(?:mrn|medical\s+record\s+(?:number|no|id|#)|patient\s+(?:id|number|no|#)|health\s+(?:record|card|insurance)\s+(?:number|no|id))\s*[:=#-]?\s*([A-Za-z0-9][A-Za-z0-9-]{3,20})\b"
+        ),
         group=1,
         validate=_identifier_with_a_digit,
     ),
@@ -651,25 +543,32 @@ SHAPES: tuple[Shape, ...] = (
     Shape(
         "patient-record-id",
         HEALTH_ID,
-        re.compile(r"(?i)\b(?:record[_ -]?id|record[_ -]?number|case[_ -]?id)\s*[:=]\s*['\"]?([A-Za-z0-9-]{3,20})['\"]?"),
+        re.compile(
+            r"(?i)\b(?:record[_ -]?id|record[_ -]?number|case[_ -]?id)['\"]?\s*[:=]\s*['\"]?([A-Za-z0-9-]{3,20})['\"]?"
+        ),
         group=1,
         context=_ci(r"patient|diagnos|clinical|medical"),
         window=160,
+        # The same guard `medical-record-number` carries: a record identifier has a digit, a
+        # schema word does not — otherwise "patient id: field" captured "field" as a health id.
+        validate=_identifier_with_a_digit,
     ),
     # ── health conditions (mask tier, PII switch) ────────────────────────
     Shape(
         "health-condition",
         HEALTH_CONDITION,
         re.compile(
-            r"(?i)\b(?:diagnos(?:ed|is)\s*(?:with|of|:)?|treatment\s+plan\s+for|treated\s+for|"
-            r"suffers?\s+from|condition\s*:|tested\s+positive\s+for)\s*['\"]?([^.,;:{}\[\]'\"\n]{3,60}?)['\"]?(?=[.,;:{}\[\]'\"\n]|$)"
+            r"(?i)\b(?:diagnos(?:ed|is)['\"]?\s*(?:with|of|:)?|treatment\s+plan\s+for|treated\s+for|"
+            r"suffers?\s+from|condition['\"]?\s*:|tested\s+positive\s+for)\s*['\"]?([^.,;:{}\[\]'\"\n]{3,60}?)['\"]?(?=[.,;:{}\[\]'\"\n]|$)"
         ),
         group=1,
     ),
     Shape(
         "medication",
         HEALTH_CONDITION,
-        re.compile(r"(?i)\b(?:on|taking|prescribed|medication\s*:?)\s+([A-Z][a-z]{3,}\s+\d+(?:\.\d+)?\s?(?:mg|mcg|ml|g|iu|units?))\b"),
+        re.compile(
+            r"(?i)\b(?:on|taking|prescribed|medication\s*:?)\s+([A-Z][a-z]{3,}\s+\d+(?:\.\d+)?\s?(?:mg|mcg|ml|g|iu|units?))\b"
+        ),
         group=1,
     ),
     # ── people (mask tier, PII switch) ──────────────────────────────────
@@ -681,13 +580,8 @@ SHAPES: tuple[Shape, ...] = (
         re.compile(
             r"(?:(?i:\b(?:name|named|full\s+name|patient|customer|client|user|employee|contact|applicant|"
             r"cardholder|account\s+holder|mr|mrs|ms|mx|dr|prof)\.?))"
-            # The separator between the role word and the name. `['\"]?` twice
-            # rather than once, because the quoted-key form is how a name
-            # actually arrives in a fixture — `'name': 'John Mercer'` and
-            # `"customer": "Jane Whitfield"` put a closing quote *before* the
-            # colon, and a single optional quote never matched it. That was a
-            # live leak, because a worker reply carrying a record is a dict
-            # literal as often as it is prose.
+            # Separator between role word and name. Two optional quotes, not one: the quoted
+            # key form `'name': 'John Mercer'` puts a closing quote *before* the colon.
             r"['\"]?\s*[:=-]?\s*['\"]?"
             r"([A-Z][a-z]{1,20}(?:\s+(?:[A-Z]\.?\s+)?[A-Z][a-z]{1,20}){1,2})['\"]?(?![a-z])"
         ),
@@ -695,10 +589,8 @@ SHAPES: tuple[Shape, ...] = (
         validate=_not_a_stopword_name,
     ),
     # ── contact (mask tier, PII switch) ─────────────────────────────────
-    # Bounded to the RFC 5321 maximums (64-char local part, 255-char domain)
-    # and fenced with a lookbehind. The unbounded `+@` form is the classic
-    # backtracking blowup: `"a."` repeated to a 24000-character reply took 1.9
-    # seconds on this one pattern alone.
+    # Bounded to RFC 5321 maximums and fenced with a lookbehind: the unbounded `+@` form is
+    # the classic backtracking blowup — 1.9 s on one 24000-character reply.
     Shape(
         "email",
         CONTACT,
@@ -733,12 +625,8 @@ SHAPES: tuple[Shape, ...] = (
         window=30,
     ),
     # ── network (mask tier, always) ─────────────────────────────────────
-    # Internal hostnames: a label that says so, or a TLD that never resolves
-    # publicly. Public hostnames are left alone — an HLD names api.example.com
-    # on purpose.
-    # One flat character class, then a Python validator. See `_is_internal_host`
-    # for why the label structure is not expressed as a regex: the nested form
-    # was a cubic-backtracking denial of service reachable from one message.
+    # Public hostnames are left alone — an HLD names api.example.com on purpose. One flat
+    # class plus a validator: the nested label regex backtracked cubically (`_is_internal_host`).
     Shape(
         "internal-hostname",
         NETWORK,
@@ -756,14 +644,8 @@ SHAPES: tuple[Shape, ...] = (
             r"192\.168\.\d{1,3}\.\d{1,3}|169\.254\.\d{1,3}\.\d{1,3})(?::\d{2,5})?\b"
         ),
     ),
-    # Absolute server-side paths reveal deployment layout and user names.
-    # Relative source paths (`src/app/main.py`) are a coding agent's daily
-    # bread and are left alone.
-    # Paths that reveal *this deployment's* layout. `/etc` is deliberately
-    # absent: it names distro-standard locations, so `/etc/nginx/nginx.conf` in
-    # an ops runbook is public knowledge and masking it only mangles the
-    # document. Bare `/var` is out for the same reason; `/var/lib`, `/var/www`
-    # and `/var/task` are in, because those are where an application lives.
+    # Absolute server-side paths reveal deployment layout and user names; relative source
+    # paths are left alone. `/etc` and bare `/var` are out: distro-standard paths are public.
     Shape(
         "server-path",
         NETWORK,
@@ -780,36 +662,16 @@ SHAPES: tuple[Shape, ...] = (
 
 
 def scan(text: str, categories: Optional[Iterable[str]] = None) -> list[Finding]:
-    """Every sensitive value in `text`, non-overlapping, in order of position.
+    """Every sensitive value in `text`, non-overlapping and in order; `categories` narrows it.
 
-    `categories` narrows the catalogue; None scans everything.
-
-    **Overlaps are merged, not resolved.** Two shapes that claim overlapping
-    spans become one finding covering their union, classified by the strongest
-    tier present and recording every label that matched. Both halves of that
-    matter, and both were bugs:
-
-      * *Merging.* Picking one winner and discarding the other left the loser's
-        overhang in the clear. `payment account: 12345678 4242 4242 4242 4242`
-        produced a `bank-account` match over the first 18 characters and a
-        `card-number` match starting inside it; discarding the card left its
-        last eight digits unmasked, in the reply, in the text relayed to the
-        worker, and in the Postgres decision trail — with no record that a card
-        had been present. Masking the union cannot leak a fragment.
-      * *Strongest tier wins.* The old sort compared length before tier, so a
-        longer weak match beat a shorter strong one:
-        `DB_PASSWORD=postgres://admin:s3cr3t99@db.internal/app` was reported as
-        a mask-tier secret assignment rather than a withhold-tier credential,
-        which meant the response was *delivered*, the stream was not stopped,
-        and the finding never counted toward the bulk threshold.
+    Overlaps are merged, not resolved — one finding over the union at the strongest tier —
+    because picking a winner left the loser's overhang in the clear and could under-tier it.
     """
     if not text:
         return []
     wanted = set(categories) if categories is not None else set(CATEGORIES)
-    # Matched against the ASCII-folded copy so a non-ASCII digit cannot hide a
-    # value from an ASCII pattern. Folding is length-preserving, so every span
-    # below indexes the *original* text and every slice returns what the user
-    # or worker actually wrote.
+    # Matched against the ASCII-folded copy so a non-ASCII digit cannot hide a value. Folding
+    # is length-preserving, so every span below indexes the *original* text.
     folded = _fold(text)
     reserved = [match.span() for match in _PLACEHOLDER.finditer(folded)]
     raw: list[Finding] = []
@@ -829,9 +691,7 @@ def scan(text: str, categories: Optional[Iterable[str]] = None) -> list[Finding]
                 folded, match.start(), match.end(), shape.context, shape.window
             ):
                 continue
-            raw.append(
-                Finding(shape.label, shape.category, start, end, text[start:end])
-            )
+            raw.append(Finding(shape.label, shape.category, start, end, text[start:end]))
     return _merge(raw, text)
 
 
@@ -880,39 +740,16 @@ def mask(text: str, findings: Iterable[Finding]) -> str:
 
 
 def redact(text: str, categories: Optional[Iterable[str]] = None) -> tuple[str, list[Finding]]:
-    """Scan and mask, sweeping until nothing new appears.
+    """Scan and mask, sweeping until nothing new appears (bounded at three passes).
 
-    One pass is not enough, because masking *creates word boundaries*. Every
-    strict shape is anchored (`\\b`, or a lookbehind) so that a 16-digit run
-    inside a git SHA is not read as a card number — and that anchor is also
-    what a neighbouring permissive match can deny it. Concretely:
-
-        /var/lib/exports/<183 chars>4242-4242-4242-4242
-
-    the `server-path` shape (a 200-character cap over a class that admits
-    digits and hyphens) matches through the first half of the card, and the
-    card's own leading `4242` sits against a letter, so `card-number` never
-    matched at all — half a payment card was delivered, masked as a file path.
-    Replacing the path with `[redacted:server-path]` puts a `]` in front of
-    the remaining digits, and the second pass sees the card.
-
-    Bounded at three passes: each one replaces at least one span with a
-    placeholder that no shape matches (the `(?!\\[redacted:)` guard on the
-    assignment rule, and the fact that a placeholder contains no value shape),
-    so the sequence terminates well inside that. The bound is belt and braces
-    against a future shape that could match a placeholder.
-
-    Spans in the returned findings refer to the text as it was when each was
-    found, so the first pass indexes the original and later passes index the
-    partially-masked copy. Callers use the labels, categories and counts —
-    `mask` has already been applied here.
+    One pass is not enough: masking *creates word boundaries*, so a permissive neighbour that
+    swallowed a strict shape's anchor stops hiding it. Spans index the text of their own pass.
     """
     out = text
     found: list[Finding] = []
     for round_number in range(3):
-        # Only the withhold tier is worth re-sweeping: those are the shapes a
-        # neighbour can hide, and a second pass over the whole catalogue would
-        # re-cost every mask for no gain.
+        # Only the withhold tier is worth re-sweeping: those are the shapes a neighbour can
+        # hide, and a full second pass would re-cost every mask for no gain.
         wanted = categories if round_number == 0 else NEVER_ALLOW
         if categories is not None and round_number > 0:
             wanted = [c for c in NEVER_ALLOW if c in set(categories)]
@@ -926,12 +763,8 @@ def redact(text: str, categories: Optional[Iterable[str]] = None) -> tuple[str, 
 
 # ── redaction at a persistence boundary ─────────────────────────────────────
 #
-# Applied where query-derived text is about to be written to a sink a human
-# queries later — the decision trail, trace metadata, a review queue row. Not
-# applied to the live conversation: a worker needs the real content, and the
-# output guard decides per category whether to mask, withhold or escalate,
-# where this only ever masks. Every replacement keeps a short label so a
-# reviewer can still see *that* a secret was present and what kind.
+# For text about to be written to a sink a human queries later, never the live conversation: a
+# worker needs real content, and the output guard — not this — decides mask/withhold/escalate.
 
 _SECRET_TIER = frozenset({CREDENTIAL, SECRET_ASSIGNMENT})
 
@@ -939,9 +772,8 @@ _SECRET_TIER = frozenset({CREDENTIAL, SECRET_ASSIGNMENT})
 def redact_text(text: str, *, pii: bool = True) -> tuple[str, int]:
     """Redact known secret/PII shapes. Returns (clean text, replacement count).
 
-    `pii=False` applies only the secret tier — credentials and secret
-    assignments — for a caller that wants a token masked without deciding
-    personal-data policy for the text. `pii=True` applies the whole catalogue.
+    `pii=False` applies only the secret tier — credentials and secret assignments — for a
+    caller that wants a token masked without deciding personal-data policy for the text.
     """
     if not text:
         return text or "", 0
@@ -952,8 +784,8 @@ def redact_text(text: str, *, pii: bool = True) -> tuple[str, int]:
 def redact_structure(value):
     """Redact every string inside a JSON-shaped structure. Returns (value, count).
 
-    Keys are left alone — they are schema, written by the agent, and redacting
-    them would break the queries an audit table exists to answer.
+    Keys are left alone: they are schema written by the agent, and redacting them would break
+    the queries an audit table exists to answer.
     """
     if isinstance(value, str):
         return redact_text(value)

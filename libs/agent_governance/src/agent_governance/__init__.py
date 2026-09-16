@@ -5,4 +5,4 @@ agent on the platform applies — packaged once so the supervisor and the worker
 agents install the same tested copy. See README.md for the module map.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

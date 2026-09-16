@@ -1,52 +1,11 @@
 """The appeal and escalation queue — Governance Blueprint §05 Stage 03 / 04.
 
-The blueprint is unusually blunt about what this has to be:
-
-    An appeal route only counts as human intervention if a human can actually
-    **enumerate** open appeals and **resolve** them, and if the outcome changes
-    what the system does next. Design the queue as queryable state with an
-    authorized reviewer action — a fire-and-forget log entry that nothing reads
-    back is not a control, however faithfully it is written.
-
-Three properties, and where each one lives
-──────────────────────────────────────────
-**Enumerable.** `list_open()` — one indexed query.
-
-**Resolvable.** `resolve()` records the reviewer, the decision, the note and the
-time, and is a no-op on an already-resolved row so two reviewers racing produce
-exactly one winner and a loud loser (§10's *"concurrency on governance state"*).
-
-**It changes what happens next.** A resolution carries a `decision`:
-
-  * `uphold` — the block stands. A later appeal on the same conversation is a
-    new row, not a retry of this one.
-  * `allow_retry` — the reviewer judged the request in scope. The next turn on
-    that conversation gets **one** pass through the agent's screen, consumed
-    atomically by `claim_allowance()` so a granted retry cannot be replayed.
-
-That last path is the one that makes this a control rather than a ticket
-system, and `claim_allowance` is where the security lives: it is a single
-conditional `UPDATE ... WHERE consumed_at IS NULL RETURNING`, so the allowance
-is spent exactly once even with concurrent turns.
-
-Why it is in the shared library
-───────────────────────────────
-The agent that opens a review is not the one that resolves it. `open_review`
-and `claim_allowance` run inside an agent's graph; `list_open` and `resolve`
-are the reviewer's half, called by whatever surface humans use — a gateway
-endpoint, a reviewer tool — against the same table. Both halves import this
-one module, so the two cannot drift, and every agent's queue has the same
-shape.
-
-Availability, deliberately
-──────────────────────────
-A governance store on the request path is the single-point-of-failure the
-blueprint warns about for rate limiting (§08). This module is not on the
-request path for ordinary traffic: an agent consults it only when the
-conversation's own checkpointed state already says a review is open. So an
-unreachable queue fails closed for conversations that are *already* escalated —
-which is the correct direction, since those are exactly the conversations that
-must not proceed unreviewed — and has no effect at all on everyone else.
+An appeal route is human intervention only if a human can enumerate open appeals (`list_open`)
+and `resolve` them, and the outcome changes what follows: `uphold`, or `allow_retry` granting
+one more pass, spent exactly once by `claim_allowance`'s conditional `UPDATE ... RETURNING`.
+Both halves live here — `open_review`/`claim_allowance` run in an agent's graph, the reviewer
+calls the rest — and the queue is consulted only when a review is already open, so an outage
+fails closed for conversations that are already escalated and affects no one else.
 """
 
 from __future__ import annotations
@@ -57,9 +16,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+from .lakebase import safe_identifier, table_exists_here
 from .sanitize import clean_worker_output
 from .sensitive import redact_text
-from .sql import safe_identifier, table_exists_here
 
 logger = logging.getLogger(__name__)
 
@@ -97,12 +56,10 @@ CREATE TABLE IF NOT EXISTS {table} (
 )
 """
 
-# A reviewer's working set is "what is open, oldest first"; an agent's per-turn
-# question is "is anything open for *this* conversation". One index each, and
-# the partial index keeps the reviewer query off the resolved history.
+# A reviewer asks "what is open, oldest first"; an agent asks "is anything open for *this*
+# conversation". One index each; the partial index keeps the reviewer query off resolved rows.
 _INDEXES = (
-    "CREATE INDEX IF NOT EXISTS {table}_open_idx ON {table} (created_at) "
-    "WHERE status = 'open'",
+    "CREATE INDEX IF NOT EXISTS {table}_open_idx ON {table} (created_at) WHERE status = 'open'",
     "CREATE INDEX IF NOT EXISTS {table}_conversation_idx "
     "ON {table} (conversation_id, created_at DESC)",
 )
@@ -139,11 +96,7 @@ class Review:
     @property
     def grants_retry(self) -> bool:
         """Resolved in the user's favour, and not yet spent."""
-        return (
-            self.status == RESOLVED
-            and self.decision == ALLOW_RETRY
-            and self.consumed_at is None
-        )
+        return self.status == RESOLVED and self.decision == ALLOW_RETRY and self.consumed_at is None
 
     def public(self) -> dict:
         """The reviewer-facing shape. No raw identifiers — `user_key` is already
@@ -176,9 +129,7 @@ _COLUMNS = (
 def _row_to_review(row) -> Review:
     """Build a `Review` from either a dict-shaped or tuple-shaped cursor row.
 
-    The Lakebase pools hand out connections with a dict row factory; a test
-    double, or a caller with its own psycopg configuration, may not. Handling
-    both keeps the module usable from either.
+    The Lakebase pools use a dict row factory; a test double or another psycopg config may not.
     """
     names = [c.strip() for c in _COLUMNS.split(",")]
     if isinstance(row, dict):
@@ -214,31 +165,23 @@ def _row_to_review(row) -> Review:
 class ReviewQueue:
     """Postgres-backed appeal and escalation queue.
 
-    Takes a *connection source* — a zero-arg callable yielding a context-managed
-    connection — for the same reason `PostgresAuditLogger` does: on Lakebase the
-    pool rotates credentials every ~15 minutes and a connection held for the
-    process lifetime would outlive its token.
+    Takes a *connection source* — a zero-arg callable yielding a context-managed connection —
+    for the same reason `PostgresAuditLogger` does: the pool rotates credentials every ~15 min.
     """
 
     def __init__(self, connection_source, table: str):
         self._source = connection_source
         # SQL cannot parameterize an identifier. Validated at construction so
-        # every interpolation below rests on an enforced property rather than on
-        # the environment variable being trustworthy.
+        # every interpolation below rests on an enforced property.
         self._table = safe_identifier(table)
         self._ready = False
 
     # ── plumbing ────────────────────────────────────────────────────────────
 
     def _ensure_table(self, conn) -> None:
-        """Create the table on first use, but only when it is absent.
-
-        `CREATE INDEX IF NOT EXISTS` takes an ownership check *before* its
-        existence check, so it raises `InsufficientPrivilege: must be owner of
-        table` for any identity that did not create the table — and because that
-        aborts the transaction, the statement behind it is lost too. In a shared
-        database that is the normal case, not an edge case. Same hard-won
-        reasoning as `audit.PostgresAuditLogger._ensure_table`.
+        """Create the table on first use, but only when it is absent: `CREATE INDEX IF NOT
+        EXISTS` checks ownership *before* existence, so for any identity that did not create
+        the table it raises and aborts the transaction — the normal case in a shared database.
         """
         if self._ready:
             return
@@ -268,25 +211,21 @@ class ReviewQueue:
     ) -> Review:
         """Record a new open review and return it.
 
-        Raises `ReviewQueueError` if the row did not land. The caller must treat
-        that as a failure to escalate rather than telling the user a human will
-        follow up — §08: *"Do not report a governance decision as applied."*
+        Raises `ReviewQueueError` if the row did not land; the caller must treat that as a
+        failure to escalate — §08: *"Do not report a governance decision as applied."*
         """
         if kind not in KINDS:
             raise ValueError(f"unknown review kind: {kind!r}")
         if not conversation_id:
             raise ValueError("a review must name the conversation it belongs to")
 
-        # Both free-text fields are cleaned *here*, at the write, rather than
-        # trusting every call site to remember: `query_excerpt` was already
-        # sanitized upstream but `reason` — the model's block/verdict text —
-        # went in raw, and both are rendered back by the reviewer surface.
-        # Redaction (secrets/PII the user pasted, which the verdict text often
-        # quotes) runs after the marker neutralisation for the same reason.
+        # Cleaned here at the write rather than trusting every call site: `reason` is the
+        # model's raw verdict text and both fields are rendered back to the reviewer.
+        # Redaction runs after marker neutralisation, since verdict text often quotes input.
         reason = redact_text(clean_worker_output(reason or "", max_chars=2000).text)[0]
-        query_excerpt = redact_text(
-            clean_worker_output(query_excerpt or "", max_chars=2000).text
-        )[0]
+        query_excerpt = redact_text(clean_worker_output(query_excerpt or "", max_chars=2000).text)[
+            0
+        ]
 
         ref = f"rev_{uuid.uuid4().hex[:16]}"
         try:
@@ -337,15 +276,11 @@ class ReviewQueue:
             query_excerpt=query_excerpt,
         )
 
-    def resolve(
-        self, ref: str, *, reviewer: str, decision: str, note: str = ""
-    ) -> Review:
+    def resolve(self, ref: str, *, reviewer: str, decision: str, note: str = "") -> Review:
         """Close one review. Exactly one caller wins.
 
-        The `WHERE status = 'open'` clause is the concurrency control (§10:
-        *"two reviewers resolving one appeal — exactly one must win, and the
-        loser must fail loudly"*). The loser gets a `ReviewQueueError` naming the
-        reviewer who won, not a silent overwrite of their colleague's decision.
+        `WHERE status = 'open'` is the concurrency control (§10). The loser gets a
+        `ReviewQueueError` naming the winner, not a silent overwrite of their decision.
         """
         if decision not in DECISIONS:
             raise ValueError(f"unknown decision: {decision!r}")
@@ -373,12 +308,9 @@ class ReviewQueue:
                         )
                         return review
 
-                    # Nothing updated: either the ref does not exist or someone
-                    # else already resolved it. Distinguish, because they need
-                    # different answers from the caller.
-                    cur.execute(
-                        f"SELECT {_COLUMNS} FROM {self._table} WHERE ref = %s", (ref,)
-                    )
+                    # Nothing updated: either the ref does not exist or someone else already
+                    # resolved it. Distinguish — the two need different answers.
+                    cur.execute(f"SELECT {_COLUMNS} FROM {self._table} WHERE ref = %s", (ref,))
                     existing = cur.fetchone()
         except ReviewQueueError:
             raise
@@ -396,14 +328,8 @@ class ReviewQueue:
     def claim_allowance(self, conversation_id: str) -> Optional[Review]:
         """Spend a granted retry for this conversation, if one is waiting.
 
-        One conditional `UPDATE ... RETURNING`, so the allowance is consumed
-        exactly once however many turns arrive at the same moment. Returns the
-        claimed review, or None when there is nothing to claim — which is the
-        overwhelmingly common case and must be cheap.
-
-        Ordering by `resolved_at` means the oldest unspent grant is used first;
-        it should be a set of one in practice, and taking the oldest is the
-        behaviour that cannot leave a grant stranded.
+        One conditional `UPDATE ... RETURNING`, so the allowance is consumed exactly once
+        however many turns arrive together; oldest grant first, so none is left stranded.
         """
         if not conversation_id:
             return None
@@ -444,9 +370,7 @@ class ReviewQueue:
             with self._source() as conn:
                 self._ensure_table(conn)
                 with conn.cursor() as cur:
-                    cur.execute(
-                        f"SELECT {_COLUMNS} FROM {self._table} WHERE ref = %s", (ref,)
-                    )
+                    cur.execute(f"SELECT {_COLUMNS} FROM {self._table} WHERE ref = %s", (ref,))
                     row = cur.fetchone()
         except Exception as exc:
             raise ReviewQueueError(f"could not read {ref}: {exc}") from exc
@@ -481,10 +405,8 @@ class ReviewQueue:
 class NullReviewQueue:
     """Stand-in for when no Postgres is configured.
 
-    Every write **raises**, which is the point: without a durable queue an agent
-    must not tell a user their appeal reached a human. Reads report nothing
-    open, so an offline run behaves exactly like a system with an empty queue
-    rather than one that refuses every turn.
+    Every write **raises**: without a durable queue an agent must not tell a user their appeal
+    reached a human. Reads report nothing open, so an offline run looks like an empty queue.
     """
 
     def open_review(self, **_kwargs) -> Review:

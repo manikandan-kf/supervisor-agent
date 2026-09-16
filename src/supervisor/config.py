@@ -1,16 +1,10 @@
 """The supervisor's governed documents, and how the graph reads them.
 
-Three documents live in the governed table, matching the three seed files in
-`config/`:
-
-    agents      the worker registry     (registry.AgentRegistry)
-    rbac        the fallback role map   (rbac.RbacPolicy)
-    guardrails  deny patterns, output policy, canaries, kill switch
-
-The store, the checksum, the TTL cache and the fallback rules are the shared
-`agent_governance.config_store`; this module owns what is specific to the
-supervisor — the validators for its two documents and the consumer objects it
-builds from all three.
+Three documents live in the governed table, matching the seeds in `config/`:
+agents (registry.AgentRegistry), rbac (rbac.RbacPolicy), guardrails (deny
+patterns, output policy, canaries, kill switch). Store, checksum, TTL cache and
+fallback rules are `agent_governance.config_store`; this module owns the
+supervisor-specific validators and the consumer objects built from all three.
 """
 
 from __future__ import annotations
@@ -35,16 +29,13 @@ from .settings import Settings
 
 CONFIG_NAMES = ("agents", "rbac", "guardrails")
 
-# Agent ids reach the invocation path, the role names derived from it and the
-# audit rows. Constraining them here keeps an id that would break one of those
-# from ever being published.
+# Agent ids reach the invocation path, derived role names and audit rows; an id
+# that would break any of those must never be published.
 _AGENT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
 _CONTEXT_KEY = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _RISK_LEVELS = frozenset({"low", "medium", "high", "critical"})
-# `name`, `description` and `domain_scope` are interpolated into the guardrail
-# and routing system prompts as trusted instruction text — a scope is a remit,
-# not a treatise, and an unbounded one is prompt real estate for smuggled
-# instructions.
+# These fields are interpolated into system prompts as trusted instruction text;
+# an unbounded scope is prompt real estate for smuggled instructions.
 _PROMPT_FIELD_LIMITS = {"name": 120, "description": 2000, "domain_scope": 4000}
 
 
@@ -75,9 +66,8 @@ def _validate_agents(payload: Any) -> None:
                 require(isinstance(row[field], str), f"{where}.{field} must be a string")
                 validate_prompt_field(row[field], where, field, limit)
 
-        # Optional per-agent model reference. Validated whenever present — a
-        # document published while multi-model is dark must still be a document
-        # that works the day it is lit. Present-but-empty is an unfinished edit.
+        # Validated whenever present, even while multi-model is dark; present-but-empty
+        # is an unfinished edit.
         if "model" in row and row["model"] is not None:
             require(
                 isinstance(row["model"], str) and row["model"].strip() != "",
@@ -119,9 +109,8 @@ def _validate_agents(payload: Any) -> None:
                 f"{at}.reason contains control characters or turn-boundary markers",
             )
 
-        # Classification only, but a typo must not silently become a class of
-        # its own — a report grouped by risk level would under-count the very
-        # traffic it exists to surface.
+        # Classification only, but a typo must not become a class of its own and
+        # under-count a report grouped by risk level.
         if "risk_level" in row and row["risk_level"] is not None:
             require(
                 isinstance(row["risk_level"], str)
@@ -173,9 +162,8 @@ def config_store(settings: Settings) -> ConfigStore:
 class SupervisorConfig:
     """The three documents as the objects the graph consumes.
 
-    Each accessor is wrapped in a `config_store.Reloading` proxy by
-    `services.build_services`, so a published change reaches a running
-    endpoint within the cache TTL.
+    Accessors are wrapped in `config_store.Reloading` by `services.build_services`,
+    so a published change reaches a running endpoint within the cache TTL.
     """
 
     def __init__(self, settings: Settings, store: ConfigStore | None = None):
@@ -209,7 +197,7 @@ class SupervisorConfig:
         decisive_threshold: float = 0.9,
         contested_margin: float = 0.15,
     ):
-        from .guardrails import GuardrailEngine
+        from .guardrail_engine import GuardrailEngine
 
         return self.provider.built(
             "guardrails",
@@ -226,9 +214,8 @@ class SupervisorConfig:
     def output_guard(self, mask_pii: bool = True):
         """Layer-7 output screen, built from the same governed guardrails doc.
 
-        Same document, separate object cache. The governance prompts'
-        distinctive lines are protected text: a worker reply that reproduces one
-        has reproduced the supervisor's instructions.
+        Separate object cache. Governance prompt lines are protected text: a reply
+        reproducing one has reproduced the supervisor's instructions.
         """
         from agent_governance.output_guard import OutputGuard
 

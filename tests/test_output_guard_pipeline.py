@@ -12,14 +12,12 @@ from __future__ import annotations
 from agent_governance.output_guard import OutputGuard
 from helpers import FAKE_DATABRICKS_TOKEN, StubAudit, StubWorkers, invoke
 
-from supervisor.dispatch import WorkerResponse
-from supervisor.nodes import OUTPUT_WITHHELD_MESSAGE
+from supervisor.messages import OUTPUT_WITHHELD_MESSAGE
+from supervisor.worker_client import WorkerResponse
 
 
 def test_a_worker_leaked_credential_never_reaches_the_user_or_the_transcript(make_graph):
-    workers = StubWorkers(
-        [WorkerResponse(text=f"Connect with {FAKE_DATABRICKS_TOKEN} today.")]
-    )
+    workers = StubWorkers([WorkerResponse(text=f"Connect with {FAKE_DATABRICKS_TOKEN} today.")])
     graph, _ = make_graph(workers=workers)
     result = invoke(graph, "write an HLD for billing on alpha")
 

@@ -1,34 +1,10 @@
-"""Governance configuration held in a table, not in the model artifact.
+"""Governance configuration served from a Lakebase Postgres table, not the model artifact.
 
-The table *is* the source of record, read at runtime, so a guardrail rule or a
-policy change is a publish that reaches a running endpoint within the cache
-TTL — not a redeploy. Each agent declares which documents it keeps here
-(`validators`: document name → validation function) and ships the bundled YAML
-seed for each; this module owns everything that is the same for all of them.
-
-**Which table.** A UC Delta table read over the Statement Execution API cannot
-work from inside Model Serving: the endpoint runs as a system service
-principal that cannot be granted `databricks-sql-access`. What does work is
-Lakebase Postgres, which an agent already holds an authenticated pool for and
-which Unity Catalog can register as a read-only catalog for discovery. One
-table, two access paths, no new entitlement.
-
-**The row is untrusted input.** Config used to be a file inside a signed model
-artifact; it is now a row in a shared database, which is a channel. Every read
-is therefore checked before it may replace anything:
-
-  * the payload is validated against the shape its consumer expects —
-    including compiling every regex, so a malformed pattern is refused here
-    rather than raising inside an engine on a live request;
-  * the stored checksum is recomputed and compared, so a row edited in place
-    rather than published through `publish()` is detected;
-  * anything that fails either check is refused, loudly, and the last document
-    that *was* legitimately published keeps serving — or the bundled seed, for
-    a process that has never read the table at all.
-
-**Freshness.** Reads are cached for `ttl_seconds` (default 60, matching
-MLflow's prompt-alias TTL). Nothing is cached across a checksum change:
-`ConfigProvider` rebuilds a consumer object only when the document differs.
+The table is the source of record, read at runtime, so a policy change reaches a live endpoint
+within the cache TTL (default 60s) rather than a redeploy; Postgres rather than UC Delta since
+Model Serving's system principal cannot hold `databricks-sql-access`. A row is untrusted input:
+each read revalidates it and recomputes its checksum, so a bad row is refused and the last good
+one keeps serving. Public: `ConfigStore`, `ConfigProvider`, `Reloading`, `validate_*` helpers.
 """
 
 from __future__ import annotations
@@ -44,7 +20,7 @@ from typing import Any, Callable, Mapping, Optional
 
 import yaml
 
-from .sql import safe_identifier, table_exists_here
+from .lakebase import safe_identifier, table_exists_here
 
 logger = logging.getLogger(__name__)
 
@@ -81,11 +57,9 @@ class ConfigError(Exception):
 
 
 def canonical(payload: Any) -> str:
-    """The exact bytes the checksum is taken over.
-
-    Sorted keys and no incidental whitespace, so the same document published
-    twice hashes the same; `ensure_ascii` so a homoglyph substitution changes
-    the digest rather than hiding inside an identical-looking string.
+    """The exact bytes the checksum is taken over: sorted keys and no incidental whitespace,
+    so the same document hashes the same twice, and `ensure_ascii` so a homoglyph substitution
+    changes the digest instead of hiding inside an identical-looking string.
     """
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
@@ -105,8 +79,7 @@ def require(condition: bool, message: str) -> None:
 def compile_pattern(pattern: str, where: str) -> None:
     """Compile a stored regex here, where a failure is a refused publish.
 
-    Left to the consumer, a bad pattern raises while building services for a
-    live request and takes the whole turn down with it.
+    Left to the consumer, a bad pattern raises while building services for a live request.
     """
     try:
         re.compile(pattern)
@@ -114,12 +87,8 @@ def compile_pattern(pattern: str, where: str) -> None:
         raise ConfigError(f"{where} is not a valid regular expression: {exc}") from exc
 
 
-# Text a governed document injects into a *system prompt* as trusted
-# instruction — an agent's name, description or domain scope — cannot be
-# demoted to the untrusted JSON turn the way user input is. The compensating
-# control is content validation at publish time: bounded length, no control
-# characters, and none of the chat-template or turn-boundary markers
-# `sanitize.py` strips from worker output.
+# Prompt-bound config text is trusted instruction and cannot be demoted to the untrusted turn
+# the way user input is, so the compensating control is content validation at publish time.
 PROMPT_FIELD_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 PROMPT_FIELD_MARKERS = re.compile(
     r"(?im)<\|[a-z_]{0,32}\|>|<\/?(?:system|assistant|user|human|im_start|im_end)>"
@@ -216,9 +185,8 @@ def _validate_canaries(payload: dict) -> None:
             not PROMPT_FIELD_CONTROL.search(token),
             f"canary_tokens[{index}] contains control characters",
         )
-        # The detector matches on the condensed form (letters and digits only),
-        # so a token that condenses to nothing would be accepted here and never
-        # armed. Same rule on both sides.
+        # The detector matches on the condensed form, so a token that condenses to nothing
+        # would be accepted here and never armed. Same rule on both sides.
         require(
             usable_canary(token),
             f"canary_tokens[{index}] must contain at least 6 ASCII letters or digits — "
@@ -227,10 +195,8 @@ def _validate_canaries(payload: dict) -> None:
 
 
 def validate_guardrails(payload: Any) -> None:
-    """The guardrails document shape every agent shares.
-
-    Input deny patterns, output policy rules, the per-category output policy,
-    canary tokens and the kill switch.
+    """The guardrails document shape every agent shares: deny patterns, the per-category
+    output policy, canary tokens and the kill switch.
     """
     require(isinstance(payload, dict), "guardrails config must be a mapping")
     validate_deny_rules(payload, "global_deny_patterns")
@@ -263,9 +229,8 @@ def validate_guardrails(payload: Any) -> None:
 class ConfigDocument:
     name: str
     payload: dict
-    # "table" when it came from the governed table, "files" when the bundled
-    # YAML stood in. Recorded rather than inferred: an operator looking at a
-    # config that is not what they published needs to see which one is live.
+    # "table" or "files", recorded rather than inferred: an operator seeing config that is not
+    # what they published needs to know which source is live.
     source: str
     version: Optional[int] = None
     checksum: str = ""
@@ -281,10 +246,8 @@ class ConfigDocument:
 class ConfigStore:
     """Reads and publishes governance documents in the Postgres table.
 
-    Takes a *connection source* — a zero-arg callable yielding a
-    context-managed connection — because on Lakebase the pool rotates
-    credentials, so a pinned connection would outlive its token. `validators`
-    maps each document name this agent keeps to its validation function.
+    Takes a *connection source* — a zero-arg callable yielding a context-managed connection —
+    because Lakebase rotates pool credentials, so a pinned connection would outlive its token.
     """
 
     def __init__(self, connection_source, table: str, validators: Mapping[str, Validator]):
@@ -306,10 +269,8 @@ class ConfigStore:
             raise ConfigError(f"unknown configuration document {name!r}")
         validator(payload)
 
-    # `CREATE INDEX IF NOT EXISTS` takes an ownership check before an existence
-    # check, so it raises for any identity that did not create the table — and
-    # aborts the surrounding transaction with it. Check first, run DDL only
-    # when there is genuinely nothing there.
+    # `CREATE INDEX IF NOT EXISTS` checks ownership before existence, so it raises for any
+    # identity that did not create the table and aborts the transaction with it. Check first.
     def _ensure_table(self, conn) -> None:
         if self._ready:
             return
@@ -326,10 +287,8 @@ class ConfigStore:
     def read(self, name: str) -> Optional[ConfigDocument]:
         """The active version of `name`, or None when nothing is published.
 
-        Raises `ConfigError` when a row exists but is unusable — a failed
-        checksum or a payload that does not validate. "Nothing published yet"
-        is an ordinary first-run state; "published but wrong" is a tamper or a
-        bad publish and has to be visible.
+        Raises `ConfigError` when a row exists but is unusable: nothing published yet is an
+        ordinary first-run state, published-but-wrong is a tamper and has to be visible.
         """
         with self._source() as conn:
             self._ensure_table(conn)
@@ -368,8 +327,8 @@ class ConfigStore:
     def publish(self, name: str, payload: dict, *, actor: str = "", comment: str = "") -> int:
         """Store `payload` as a new version of `name` and make it the active one.
 
-        Validated before it is written, so an invalid document is refused at
-        publish time rather than discovered by the endpoint a minute later.
+        Validated before it is written, so an invalid document is refused at publish time
+        rather than discovered by a live endpoint a minute later.
         """
         self.validate(name, payload)
 
@@ -459,19 +418,10 @@ def load_bundled(config_dir: Path, name: str) -> dict:
 
 
 class ConfigProvider:
-    """Serves the current configuration to an agent, TTL-cached.
-
-    Two caches, deliberately separate: the *document* cache bounds how often a
-    live endpoint queries Postgres, and the *object* cache holds each built
-    consumer keyed on the document's checksum, so a TTL expiry that finds the
-    config unchanged does not recompile every regex.
-
-    `connection_source` is a zero-arg callable that returns a connection source
-    (itself a zero-arg context-manager factory) or None when no Postgres is
-    configured; it is called lazily, on the first load. `source` is `auto`
-    (table when Postgres is configured, else files), `table` (require the
-    table; log an error and fall back if it is missing) or `files` (bundled
-    YAML only — offline tests and local iteration).
+    """Serves the current configuration to an agent, TTL-cached. Two caches, deliberately
+    separate: the *document* cache bounds how often a live endpoint queries Postgres, and the
+    *object* cache is keyed on the checksum so an unchanged document is not rebuilt. `source`
+    is `auto`, `table` (log and fall back when missing) or `files` (bundled YAML only).
     """
 
     def __init__(
@@ -498,12 +448,9 @@ class ConfigProvider:
         # Complain once per document per failure mode; a 60-second TTL on a
         # broken table would otherwise write a log line a minute forever.
         self._reported: dict[str, str] = {}
-        # The last document successfully read *from the table*, per name.
-        # "Fall back to the bundled YAML" is not the safe default it looks like:
-        # published config moves in both directions, and reverting to the
-        # bundle when the table is briefly unreadable can silently *widen* the
-        # policy. Serving the last known-good table document is the fail-closed
-        # reading that is also available.
+        # Falling back to the bundled YAML is not the safe default it looks like: published
+        # config moves in both directions, so a revert can silently *widen* policy. Holding the
+        # last known-good table document per name is the fail-closed reading.
         self._last_good: dict[str, ConfigDocument] = {}
 
     @property
@@ -588,9 +535,8 @@ class ConfigProvider:
 
         if document is None:
             self._report(name, "empty", "nothing published in the table yet")
-            # Not `_fallback`: nothing published is not a failure to read, and a
-            # document later deleted from the table should not be resurrected
-            # from this process's memory. The bundle is the answer.
+            # Not `_fallback`: nothing published is not a failure to read, and a document
+            # later deleted from the table must not be resurrected from this process's memory.
             return self._bundled(name)
 
         if self._reported.pop(name, None):
@@ -603,9 +549,8 @@ class ConfigProvider:
     def built(self, name: str, builder: Callable[[dict], Any], cache_key: str = "") -> Any:
         """Build (or reuse) the object form of a document.
 
-        `cache_key` separates two consumers of the *same* document — an input
-        engine and an output guard both built from "guardrails" — so each keeps
-        its own object without evicting the other's on every call.
+        `cache_key` separates two consumers of the *same* document — an input engine and an
+        output guard both built from "guardrails" — so neither evicts the other's object.
         """
         key = cache_key or name
         document = self.load(name)
@@ -622,11 +567,8 @@ class ConfigProvider:
 class Reloading:
     """Delegates every attribute to whatever the provider currently serves.
 
-    Services are built once per process, so a config object captured at build
-    time would pin the configuration to the moment of the last deploy — exactly
-    what moving config into a table is meant to end. Attribute lookup goes
-    through the provider instead: a TTL check and two dict lookups in the common
-    case. Callers cannot tell a live-reloading object from a fixed one.
+    Services are built once per process, so a config object captured at build time would pin
+    policy to the last deploy — exactly what moving config into a table is meant to end.
     """
 
     __slots__ = ("_load",)

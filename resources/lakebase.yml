@@ -1,0 +1,61 @@
+# Shared infrastructure: the Lakebase instance and the platform library volume.
+#
+# Both are declared here but SHIP DISABLED, and the reason is not caution — it
+# is that both are shared by things this bundle does not own:
+#
+#   * one Lakebase instance serves every environment (dev and prod are separated
+#     by `lakebase_schema`, not by instance), and
+#   * the library volume is written by this agent and read by every other agent
+#     on the platform.
+#
+# A bundle target that declares a resource also expects to create it. Two
+# targets declaring the same name means the second `bundle deploy` fails on a
+# resource that already exists — so enabling these as they stand only works when
+# a single target owns them.
+#
+# ── To let the bundle own the Lakebase instance ──────────────────────────────
+#
+# 1. Give each target its own instance, so the two never collide. In
+#    databricks.yml set, per target:
+#        lakebase_instance: supervisor-memory-${bundle.target}
+#    Budget for it: an instance bills continuously, so this is two bills.
+# 2. Uncomment the block below.
+# 3. Create it once with `databricks bundle deploy`, and drop §3 of the runbook.
+#
+# `prevent_destroy` is what makes this survivable: `bundle destroy` refuses
+# rather than deleting every conversation, audit row and governed document in
+# the instance. Do not remove it.
+#
+# resources:
+#   database_instances:
+#     supervisor_memory:
+#       name: ${var.lakebase_instance}
+#       capacity: CU_1
+#       lifecycle:
+#         prevent_destroy: true
+#
+# ── To let the bundle own the library volume ─────────────────────────────────
+#
+# Only one agent repository may own it — whichever publishes the wheel. If that
+# is this one, uncomment below and delete the `publish_library` task's volume
+# creation path (publish_library.py creates it imperatively today, which is why
+# the volume does not need to exist first).
+#
+# `grants` is the declarative form of runbook §7d: each consuming agent's deploy
+# identity needs READ_VOLUME and nothing more. Whoever can write this volume can
+# replace the output guard, the RBAC check and the audit sink for every agent at
+# once, so write stays with the one deploy identity.
+#
+# resources:
+#   volumes:
+#     library_volume:
+#       catalog_name: ${var.catalog}
+#       schema_name: ${var.platform_schema}
+#       name: ${var.library_volume}
+#       comment: Shared governance wheels, published for every agent on the platform.
+#       lifecycle:
+#         prevent_destroy: true
+#       grants:
+#         - principal: <worker-agent-deploy-identity>
+#           privileges:
+#             - READ_VOLUME

@@ -1,34 +1,11 @@
 """Publish governance configuration to the Unity Catalog table.
 
-This is how a guardrail rule, a role mapping or a worker registry entry changes
-now — a publish, not a redeploy. R1 puts the supervisor's configuration
-"directly in Unity Catalog tables (pre-wrapper-API)": the table is the source of
-record, `supervisor.config` reads it at runtime, and there is
-deliberately no validating write service in front of it. This script is the
-write path.
-
-The table is Lakebase Postgres, registered in Unity Catalog as the read-only
-catalog `supervisor_memory` — so the same rows are
-`supervisor_memory.public.supervisor_config` in the SQL editor and an ordinary
-INSERT here. `config_store` explains why that is the governed table this project
-can actually use rather than a plain UC Delta one.
-
-    # what is live, and every version behind it
-    python deploy/publish_config.py --list
-
-    # would this publish change anything?  (default: nothing is written)
-    python deploy/publish_config.py --diff
-
-    # publish the bundled YAML as new versions and make them active
-    python deploy/publish_config.py --apply
-    python deploy/publish_config.py --apply --only guardrails -m "tighten injection rule"
-
-    # roll one document back to an earlier version
-    python deploy/publish_config.py --pin guardrails=3
-
-Nothing is written without `--apply` or `--pin`. A document whose payload is
-byte-identical to the active version is skipped rather than republished, so
-re-running this in a deploy job does not manufacture a version per deploy.
+A guardrail rule, role mapping or worker registry entry changes by publish, not redeploy: R1
+puts configuration "directly in Unity Catalog tables (pre-wrapper-API)", so the table is the
+source of record, `supervisor.config` reads it at runtime and this script is the write path, with
+deliberately no validating service in front. The table is Lakebase Postgres surfaced as the UC
+catalog `supervisor_memory` (`config_store` explains why). Nothing is written without `--apply` or
+`--pin`; a payload identical to the active version is skipped, so a deploy job mints no versions.
 """
 
 from __future__ import annotations
@@ -42,17 +19,10 @@ from pathlib import Path
 
 
 def _repo_root() -> Path:
-    """Repository root, however this file is being run.
+    """Repository root, however this file is run.
 
-    A Databricks `spark_python_task` does not import the script — it reads the
-    source and `exec`s it inside a notebook kernel, so `__file__` is never
-    bound and `Path(__file__)` raises NameError. The code object compiled from
-    that source still carries the real path, so the frame is the reliable
-    fallback.
-
-    Without it the task fails on its first real run with `NameError: name
-    '__file__' is not defined`, taking every task that depends on it down as an
-    upstream failure. Same helper as the other deploy scripts; keep them identical.
+    A `spark_python_task` `exec`s the source in a notebook kernel, so `__file__` is unbound;
+    the compiled code object still carries the real path. Same helper as the other deploy scripts.
     """
     try:
         here = Path(__file__)
@@ -85,6 +55,22 @@ def _store(settings: Settings) -> ConfigStore:
         raise SystemExit(str(exc)) from None
 
 
+def _policy_report(candidate: dict, config_dir: Path):
+    """The policy suite's verdict on a candidate guardrails document, or None.
+
+    None means the check could not run; the caller treats that as a refusal, because "could not
+    check" and "checked and clean" must never be the same answer on the path that reaches
+    production without a redeploy. The suite sits beside the document so both ship in one diff.
+    """
+    try:
+        from agent_governance.policy_eval import evaluate, load_suite
+
+        return evaluate(candidate, load_suite(config_dir / "policy_suite.yaml"))
+    except Exception as exc:  # noqa: BLE001 — reported, then refused by the caller
+        print(f"policy suite error: {exc}")
+        return None
+
+
 def _actor() -> str:
     for name in ("DATABRICKS_CLIENT_ID", "USER", "USERNAME"):
         value = os.getenv(name)
@@ -102,7 +88,9 @@ def _selected(only: str | None) -> tuple[str, ...]:
     names = tuple(part.strip() for part in only.split(",") if part.strip())
     unknown = [n for n in names if n not in CONFIG_NAMES]
     if unknown:
-        raise SystemExit(f"unknown document(s): {', '.join(unknown)}; known: {', '.join(CONFIG_NAMES)}")
+        raise SystemExit(
+            f"unknown document(s): {', '.join(unknown)}; known: {', '.join(CONFIG_NAMES)}"
+        )
     return names
 
 
@@ -148,7 +136,9 @@ def cmd_diff(store: ConfigStore, settings: Settings, names: tuple[str, ...]) -> 
         elif live.checksum == checksum_of(bundled):
             print(f"{name}: unchanged (active v{live.version})")
         else:
-            print(f"{name}: differs from active v{live.version} — would publish v{live.version + 1}")
+            print(
+                f"{name}: differs from active v{live.version} — would publish v{live.version + 1}"
+            )
             changed += 1
     print(f"\n{changed} document(s) would change. Re-run with --apply to publish.")
     return 0
@@ -164,6 +154,26 @@ def cmd_apply(store: ConfigStore, settings: Settings, names: tuple[str, ...], me
         except ConfigError as exc:
             print(f"{name}: REFUSED — {exc}")
             return 1
+
+        # The guardrails document reaches a live endpoint without a redeploy, so this is the only
+        # automated check between an edited regex and production traffic. Run on the *candidate*
+        # and refuse the publish rather than report afterwards; offline, so it cannot flake.
+        if name == "guardrails":
+            report = _policy_report(bundled, settings.config_dir)
+            if report is None:
+                print(f"{name}: REFUSED — the policy suite could not be run")
+                return 1
+            if not report.passed:
+                print(f"{name}: REFUSED — {report.summary()}")
+                for line in report.report_lines():
+                    print(line)
+                print(
+                    "\nNothing was published. Fix the rule, or update "
+                    "src/supervisor/config/policy_suite.yaml if the new behaviour is "
+                    "intended — a deliberate policy change should edit its expectation."
+                )
+                return 1
+            print(f"{name}: {report.summary()}")
 
         try:
             live = store.read(name)
@@ -214,11 +224,15 @@ def cmd_show(store: ConfigStore, name: str) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--list", action="store_true", help="show every published version")
     parser.add_argument("--diff", action="store_true", help="what --apply would change (default)")
     parser.add_argument("--apply", action="store_true", help="publish the bundled YAML")
-    parser.add_argument("--pin", metavar="NAME=VERSION", help="make an existing version active again")
+    parser.add_argument(
+        "--pin", metavar="NAME=VERSION", help="make an existing version active again"
+    )
     parser.add_argument("--show", metavar="NAME", help="print one document as it is stored")
     parser.add_argument("--only", metavar="NAMES", help="comma-separated subset of documents")
     parser.add_argument("-m", "--message", default="", help="comment recorded with the version")
@@ -246,15 +260,13 @@ def main() -> int:
         # reads the environment at call time.
         os.environ["LAKEBASE_INSTANCE"] = args.lakebase_instance
     if args.lakebase_schema:
-        # Same timing rule, and the reason it is a flag rather than inherited
-        # from the environment: a publish that silently went to `public` would
-        # write a version nothing reads while reporting success.
+        # Same timing rule; a flag rather than inherited because a publish that silently went to
+        # `public` would write a version nothing reads while reporting success.
         os.environ["LAKEBASE_SCHEMA"] = args.lakebase_schema
     settings = Settings()
     store = _store(settings)
-    # Which environment is about to change. With one schema per environment the
-    # only difference between publishing to dev and publishing to prod is this
-    # line, so print it rather than leaving it to be inferred from the flags.
+    # With one schema per environment this line is the only difference between publishing to dev
+    # and to prod, so print it rather than leave it to be inferred from the flags.
     print(
         f"target: {os.getenv('LAKEBASE_SCHEMA') or 'public'}.{settings.config_table} "
         f"on {os.getenv('LAKEBASE_INSTANCE') or '(no LAKEBASE_INSTANCE set)'}\n"
@@ -274,14 +286,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    # `raise SystemExit(main())` raises SystemExit even for a zero return, and a
-    # Databricks `spark_python_task` surfaces *any* exception escaping the
-    # exec'd source as a task failure — a clean exit included, which reports a
-    # task that did its work correctly as FAILED and skips everything
-    # downstream. So only exit explicitly when there is a real failure to
-    # report; success falls off the end, which is exit code 0 for a normal CLI
-    # run and a clean finish for the job. Same epilogue as
-    # `register_prompts.py`.
+    # A spark_python_task fails on any escaping exception, SystemExit(0) too: exit only on failure.
     _exit_code = main()
     if _exit_code:
         sys.exit(_exit_code)

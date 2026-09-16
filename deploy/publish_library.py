@@ -1,22 +1,11 @@
 """Publish the shared governance wheel to the platform's Unity Catalog volume.
 
-`databricks bundle deploy` builds `libs/agent_governance/dist/*.whl` (the
-`artifacts` block in databricks.yml) and installs it into this job's
-environment. The supervisor itself never reads the volume — its deploy bakes
-the same wheel into its model artifact (see log_and_deploy.py) — but the worker
-agents (requirement, test-case, coding, deployment) install their copy from
-here, so every agent on the platform runs one tested library:
-
-    /Volumes/<catalog>/<schema>/<volume>/agent_governance-<version>-py3-none-any.whl
-
-Runs as the DAB job task `publish_library`, or by hand:
-
-    python deploy/publish_library.py --catalog workspace --schema agent_platform --volume libs
-
-A version already present is left alone unless `--overwrite` is passed: a
-published wheel is something another agent may have pinned, and the same
-version name with different bytes is how two teams end up debugging two
-different libraries under one name. Bump `agent_governance.__version__` instead.
+`databricks bundle deploy` builds `libs/agent_governance/dist/*.whl`. The supervisor never reads
+the volume (its deploy bakes the same wheel into the model artifact, see log_and_deploy.py); the
+worker agents install their copy from here, so every agent runs one tested library. Runs as the
+DAB job task `publish_library`, or by hand with `--catalog/--schema/--volume`. A version already
+present is left alone unless `--overwrite`: another agent may have pinned it, and one version
+name with different bytes is how two teams debug two libraries under one name. Bump `__version__`.
 """
 
 from __future__ import annotations
@@ -76,7 +65,10 @@ def ensure_volume(w, catalog: str, schema: str, volume: str) -> None:
         print(f"creating volume {catalog}.{schema}.{volume}")
         try:
             w.volumes.create(
-                catalog_name=catalog, schema_name=schema, name=volume, volume_type=VolumeType.MANAGED
+                catalog_name=catalog,
+                schema_name=schema,
+                name=volume,
+                volume_type=VolumeType.MANAGED,
             )
         except AlreadyExists:
             pass
@@ -91,8 +83,12 @@ def main() -> int:
         help="the platform-wide schema shared by every agent (not an environment schema)",
     )
     parser.add_argument("--volume", default=os.getenv("LIBRARY_VOLUME", "libs"))
-    parser.add_argument("--wheel", default="", help="wheel file to publish; default: newest in dist/")
-    parser.add_argument("--overwrite", action="store_true", help="replace an existing file of the same name")
+    parser.add_argument(
+        "--wheel", default="", help="wheel file to publish; default: newest in dist/"
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="replace an existing file of the same name"
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -130,9 +126,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    # A `spark_python_task` surfaces *any* exception escaping the exec'd source
-    # as a task failure, a zero SystemExit included — so exit explicitly only on
-    # a real failure. Same epilogue as the other deploy scripts.
+    # A spark_python_task fails on any escaping exception, SystemExit(0) too: exit only on failure.
     _exit_code = main()
     if _exit_code:
         sys.exit(_exit_code)

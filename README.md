@@ -39,45 +39,63 @@ libs/agent_governance/               the shared library — one wheel every agen
   src/agent_governance/
     sensitive.py       the sensitive-shape catalogue every boundary reads, + redact helpers
     output_guard.py    response policy: allow / mask / block / escalate, and the stream guard
-    sanitize.py        untrusted text handling: control chars, fake turn boundaries, directives
+    sanitize.py        untrusted text at the prompt boundary, both directions: control
+                       chars and fake turn boundaries in, JSON-delimited data turns out
     deny_rules.py      tier-1 deterministic deny patterns and the kill switch
-    prompting.py       untrusted content in its own JSON turn; cacheable system prefix
     grounding.py       execution claims and citations nothing in the turn backs
     trust.py           HMAC over entitlements and dispatches — a worker calls verify_dispatch
-    rbac.py            role → agent authorization
-    deadline.py        per-turn time budget
-    resilience.py      bounded retries for transient model failures
+    rbac.py            role → agent authorization, and the startup check that the
+                       governance tables' grants were actually applied
+    resilience.py      the per-turn time budget and the bounded retries inside it
     spend.py           per-turn and per-subject cost ceilings
-    audit.py           decision-trail sink with the tamper-evident hash chain
+    audit.py           decision-trail sink with the tamper-evident hash chain, and its verifier
+    retention.py       conversation sweeps and subject erasure, recorded through the audit sink
+    policy_eval.py     deterministic regression evaluation of a candidate guardrails document
+    observability.py   JSON logging and the per-turn correlation ids every line carries
     review_queue.py    appeal / escalation queue — opened by an agent, resolved by a reviewer surface
     locking.py         one execution per conversation: the advisory lock Model Serving does not provide
     config_store.py    governed configuration in a table: checksummed, validated, TTL-cached
-    lakebase.py        Lakebase pools, checkpointer and store builders, connection sources
-    sql.py             identifier validation; the schema-aware table probe
+    lakebase.py        Lakebase pools, checkpointer and store builders, connection sources,
+                       SQL identifier validation and the schema-aware table probe
     environment.py     is_local_environment, resource_environment, catalog, environment_schema
   tests/               the library's own tests, offline
 
 src/supervisor/                      the supervisor agent
   agent.py           MLflow ResponsesAgent wrapper — predict / predict_stream
   graph.py           StateGraph wiring and durability
-  nodes.py           the six stages above
-  messages.py        every sentence the supervisor says in its own voice
-  state.py           the conversation state channels
-  context.py         per-request runtime context (role, entitlements, identity)
+  nodes/             the six stages above, one module per stage
+    turn.py            what every stage reads, records and measures about a turn
+    rbac_gate.py       1. RBAC gate — entitlements, session lifetime, review holds
+    guardrails.py      2. both guardrail tiers, small talk, session notes, held requests
+    route.py           3. context resolution and clarification
+    dispatch.py        4. the worker call and what comes back
+    approval.py        4b. the human sign-off pause, in a node of its own
+    respond.py         5. the single exit: audit, then answer
+    limits.py          what any stage does when time, budget or patience runs out
+                     ^ a module named for a node holds that node and nothing else,
+                       spelled exactly as graph.py registers it; everything else is
+                       named for what it is, so no two files here share a name
+  messages.py        every sentence the supervisor says, and the streamed task plan
+  state.py           the checkpointed state channels, and the per-run context
+                     (role, entitlements, identity) that is never checkpointed
   registry.py        worker agent registry
-  guardrails.py      the semantic domain screen, small-talk classifier, ownership contest
-  routing.py         context resolution and clarification
-  dispatch.py        worker client: timeout, retry, circuit breaker; the simulated worker
+  guardrail_engine.py
+                     the two-tier screen: deny rules, then the semantic domain
+                     verdict; small-talk classifier; ownership contest
+  routing.py         the Router the route stage calls: resolves the context a
+                     worker needs, and writes the clarifying question when it cannot
+  worker_client.py   the Model Serving client the dispatch stage calls: timeout,
+                     retry, circuit breaker; the simulated worker
   memory.py          the supervisor's Lakebase schema; long-term memory — validated
                      on write, narrowed on read, aged out on a retention ceiling
   session_notes.py   "keep this in mind for later" — short-term, this thread only
   config.py          the supervisor's governed documents and their validators
-  progress.py        the task-plan events streamed while a turn runs
   prompt_provider.py prompts from the MLflow registry, bundled fallbacks
   model_provider.py  the ChatDatabricks client for the routing model (and per-agent models)
   services.py        the dependency container
   settings.py        every tunable, read from the environment
-  config/            agents.yaml · rbac.yaml · guardrails.yaml (seed documents)
+  config/            agents.yaml · rbac.yaml · guardrails.yaml (seed documents),
+                     policy_suite.yaml (the corpus the guardrails document must satisfy)
 
 deploy/
   log_and_deploy.py    logs, registers and deploys the model, with the library wheel baked in
@@ -85,7 +103,11 @@ deploy/
   publish_config.py    publishes the governed documents to the configuration table
   publish_library.py   publishes the library wheel to the platform volume, for other agents
 tests/                 the supervisor's governance contract, offline
-databricks.yml         the asset bundle: schema, library artifact, deploy job
+databricks.yml         the asset bundle: variables, library artifact, sync, targets
+resources/             one file per bundle resource, merged by the `include` glob
+  schema.yml             the Unity Catalog schema this environment owns
+  deploy_job.yml         the job that registers, publishes and deploys
+  lakebase.yml           shared infrastructure — ships disabled, see the file
 pyproject.toml         project metadata, dependencies, ruff and pytest config
 requirements.txt       what the serving container installs — pinned exactly
 ```

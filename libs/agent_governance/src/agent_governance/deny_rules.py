@@ -1,13 +1,9 @@
 """Tier-1 deterministic guardrail rules — the shape every agent's screen shares.
 
-A rule is `{pattern, reason, action?}`. `action` is `block` (refuse, the
-default) or `escalate` (refuse *and* hand the conversation to a human
-reviewer). The same shape governs input deny patterns and output policy rules,
-so a rule written for one boundary reads the same at the other.
-
-Precision over recall: a pattern here should be something no legitimate
-request contains, because a false block costs the user their route in. The
-semantic tier, where an agent has one, judges everything these do not catch.
+A rule is `{pattern, reason, action?}`; `action` is `block` (default) or `escalate` (refuse and
+hand to a human reviewer). One shape governs input deny patterns and output policy rules.
+Precision over recall: a false block costs the user their route in, and the semantic tier judges
+what these do not catch.
 """
 
 from __future__ import annotations

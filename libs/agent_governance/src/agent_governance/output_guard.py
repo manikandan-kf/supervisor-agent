@@ -1,62 +1,10 @@
-"""Output guardrail — the last check before generated text reaches a user.
+"""Output guardrail (layer 7) — the last check before generated text reaches a user.
 
-Layer 7 of the guardrail stack ("nothing reaches the user unchecked"). Three
-boundaries, one policy:
-
-  * **the reply** — every worker response is screened in `nodes.dispatch`
-    before the text enters state, so checkpoints, the approval gate and the
-    user only ever see guarded text;
-  * **the relay** — the conversation forwarded *to* a worker is screened the
-    same way (`relay`), so a credential or identifier the user pasted never
-    reaches the worker in the first place and cannot be echoed back;
-  * **the stream** — tokens relayed live are masked with a hold-back window
-    and stopped outright once a block-tier finding appears (`StreamGuard`),
-    so the closing item is not the first place the screen applies.
-
-Two structural properties carry most of the layer's weight, and both are
-worth stating because a screen without them looks present and catches almost
-nothing:
-
-  1. **The catalogue has to be wide.** A screen that knows credential tokens
-     and email addresses passes names, phones, national identifiers, payment
-     cards, bank accounts, health identifiers, dates of birth, internal
-     hostnames and server paths through verbatim. `sensitive.py` is the
-     catalogue, with checksums and context gates where the vendors use them.
-  2. **The decision must not be binary.** If masking is the only reachable
-     action — `output_deny_patterns` ships empty and nothing classifies a
-     finding — then "block" and "escalate" exist in the design and nowhere in
-     the code. `OutputPolicy` maps every finding category to an action, the
-     governed guardrails document can override each one, and a bulk
-     disclosure (five or more high-tier values in one reply) escalates to a
-     human instead of being quietly masked value by value.
-
-Defaults follow the sensitivity tiers Google DLP, AWS Bedrock Guardrails and
-Databricks `detect_sensitive_data` agree on: credentials, national
-identifiers, payment and bank data and health identifiers are withheld;
-names, contact details, dates of birth, health conditions and network detail
-are masked. Every default is one line in `guardrails.yaml` to change, and a
-publish that sets a high-tier category to `allow` is refused.
-
-Two controls that are easy to leave out and expensive to add later:
-
-  * **Canary and prompt-leak detection.** A per-process canary is planted in
-    the simulated worker's prompt, operators can register the canaries they
-    plant in real workers (`canary_tokens`), and distinctive lines of the
-    supervisor's own governance prompts are protected text. Any of them
-    surfacing in a reply is a critical finding: the response is withheld and
-    the conversation escalated, whatever the request looked like.
-  * **Governance text scrubbing.** The screen's `reason` and clarification
-    questions are model-written and shown to the user word for word; they
-    pass through `scrub` so a prompt-injected verdict cannot carry a secret
-    or the prompt itself out through the refusal message.
-
-What this module is still *not*: a toxicity classifier or an LLM moderation
-pass. Running a second model over every reply doubles cost and latency to
-judge workers that are themselves governed internal agents, and a model-based
-check can be argued with — the same reasoning as `guardrails.py`'s tier 1.
-Platform-level moderation (Databricks AI Gateway guardrails on the serving
-endpoints) is the right home for classifier-based screening and composes with
-this module rather than replacing it.
+Entry points: `OutputGuard` (`screen` a reply, `relay` text to a worker, `scrub` model-written
+governance text, `stream_should_hold`), `StreamGuard` (hold-back window over live tokens),
+`OutputPolicy` (category → allow/mask/block/escalate, overridable per governed document) and
+`PROCESS_CANARY` / `usable_canary` for prompt-leak detection. Tiers follow Google DLP, Bedrock
+Guardrails and Databricks `detect_sensitive_data`; not a toxicity/LLM pass (AI Gateway's job).
 """
 
 from __future__ import annotations
@@ -96,10 +44,8 @@ DEFAULT_CATEGORY_ACTIONS: dict[str, str] = {
 # Five or more high-tier values in one reply is a data dump, not an echo.
 DEFAULT_ESCALATE_AT_FINDINGS = 5
 
-# The canary this process plants in prompts it controls. Random per process
-# (AWS's guidance: unique, unlikely in legitimate output), matched after
-# whitespace/case normalisation so letter-spacing does not evade it. A worker
-# that reproduces it has reproduced its instructions.
+# The canary this process plants in prompts it controls. Random per process (AWS guidance),
+# matched after whitespace/case normalisation so letter-spacing does not evade it.
 PROCESS_CANARY = "CANARY-" + secrets.token_hex(6).upper()
 
 
@@ -113,11 +59,8 @@ def _condense(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (text or "").lower())
 
 
-#: The floor a canary must clear to be armed. Matching happens on the condensed
-#: form, so a token made only of punctuation, or written in a non-Latin script,
-#: condenses to nothing and would never fire. `config_store` refuses to publish
-#: one — the validator and the detector have to agree about what counts, or a
-#: publish succeeds and the honeytoken is silently inert.
+#: The floor a canary must clear to be armed: matched on the condensed form, a punctuation-only
+#: token never fires. `config_store` refuses to publish one — validator and detector must agree.
 CANARY_MIN_CONDENSED = 6
 
 
@@ -175,11 +118,8 @@ class OutputScreenResult:
 class OutputPolicy:
     """What to do about each category of finding.
 
-    Built from the governed guardrails document's `output_policy` section, or
-    from the defaults when it is absent. `mask_pii=False` (the
-    `OUTPUT_PII_MASKING` switch) relaxes the PII tier — names, contact
-    details, dates of birth, health conditions — to `allow`; it never touches
-    the high tier, which the switch was never meant to govern.
+    Built from the governed document's `output_policy` section, else the defaults.
+    `mask_pii=False` relaxes the PII tier to `allow`; it never touches the high tier.
     """
 
     category_actions: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_CATEGORY_ACTIONS))
@@ -214,9 +154,8 @@ class OutputPolicy:
 class OutputGuard:
     """Deterministic screen over one outbound response.
 
-    Built from the same governed guardrails document as the input engine, so a
-    published pattern change reaches a running endpoint through the existing
-    `Reloading` proxy — no redeploy, no second config plane.
+    Built from the same governed guardrails document as the input engine, so a published
+    pattern change reaches a running endpoint through the `Reloading` proxy — no redeploy.
     """
 
     def __init__(
@@ -233,9 +172,7 @@ class OutputGuard:
             _condense(c) for c in (*canaries, PROCESS_CANARY) if c and usable_canary(c)
         )
         self._protected = tuple(
-            _normalise(line)
-            for line in protected_texts
-            if line and len(_normalise(line)) >= 40
+            _normalise(line) for line in protected_texts if line and len(_normalise(line)) >= 40
         )
 
     @classmethod
@@ -264,11 +201,8 @@ class OutputGuard:
     def leak_in(self, text: str) -> str:
         """Why `text` is a prompt leak, or "" if it is not.
 
-        Canaries are matched on the condensed form (letters and digits only),
-        so `C A N A R Y - 7F3A` and `canary_7f3a` both count. Protected prompt
-        lines are matched on the whitespace-normalised form: a worker that
-        reproduces forty-plus characters of a governance prompt verbatim has
-        reproduced its instructions, whatever the request was.
+        Canaries match on the condensed form (`C A N A R Y - 7F3A` counts); protected prompt
+        lines match whitespace-normalised — forty-plus characters reproduced is a leak.
         """
         if not text:
             return ""
@@ -287,9 +221,7 @@ class OutputGuard:
     def screen(self, text: str) -> OutputScreenResult:
         """Screen one response. Leak check, policy rules, then the catalogue.
 
-        Policy rules run on the raw text so a rule can match what masking
-        would rewrite; a withheld response is discarded by the caller, so
-        masking it would be work done on text nobody will see.
+        Policy rules run on the raw text so a rule can match what masking would rewrite.
         """
         raw = text or ""
         leak = self.leak_in(raw)
@@ -300,10 +232,8 @@ class OutputGuard:
             if rule.regex.search(raw):
                 return OutputScreenResult(text="", action=rule.action, reason=rule.reason)
 
-        # `redact` rather than `scan` + `mask`: it sweeps until nothing new
-        # appears, because masking creates the word boundaries a strict shape
-        # needs when a permissive neighbour has swallowed them. See its
-        # docstring for the half-a-card-number case that motivates it.
+        # `redact` rather than `scan` + `mask`: it sweeps until nothing new appears, because
+        # masking creates the word boundaries a strict shape needs.
         masked, findings = sensitive.redact(raw, self._policy.active_categories())
         if not findings:
             return OutputScreenResult(text=raw)
@@ -319,9 +249,7 @@ class OutputGuard:
                     strongest, strongest_label = action, finding.label
 
         bulk = [
-            f
-            for f in findings
-            if set(f.categories or (f.category,)) & sensitive.BULK_CATEGORIES
+            f for f in findings if set(f.categories or (f.category,)) & sensitive.BULK_CATEGORIES
         ]
         threshold = self._policy.escalate_at_findings
         if threshold and len(bulk) >= threshold and _SEVERITY[strongest] < _SEVERITY[ESCALATE]:
@@ -331,9 +259,7 @@ class OutputGuard:
         categories = tuple(
             dict.fromkeys(c for f in findings for c in (f.categories or (f.category,)))
         )
-        labels = tuple(
-            dict.fromkeys(x for f in findings for x in (f.labels or (f.label,)))
-        )
+        labels = tuple(dict.fromkeys(x for f in findings for x in (f.labels or (f.label,))))
         if strongest in (BLOCK, ESCALATE):
             return OutputScreenResult(
                 text="",
@@ -365,10 +291,8 @@ class OutputGuard:
     def relay(self, text: str) -> tuple[str, tuple[Finding, ...]]:
         """Mask what must not reach a worker. Never withholds.
 
-        The same categories the reply screen acts on, masked rather than
-        blocked: a user who pasted a connection string still gets their
-        script, minus the credential the worker never needed. What was masked
-        is returned so the dispatch node can tell the user and the trail.
+        Masked rather than blocked: a user who pasted a connection string still gets their
+        script, minus the credential. What was masked is returned for the trail.
         """
         masked, findings = sensitive.redact(text or "", self._policy.active_categories())
         return masked, tuple(findings)
@@ -378,10 +302,8 @@ class OutputGuard:
     def scrub(self, text: str, fallback: str = "") -> str:
         """Make model-written governance text safe to show.
 
-        A screen verdict's `reason` and a clarifying question are generated
-        under a prompt that untrusted content can try to steer. Secrets and
-        identifiers in them are masked; if the text carries a canary or
-        protected prompt line, `fallback` is shown instead.
+        A verdict `reason` or clarifying question is generated under a prompt untrusted content
+        can steer: secrets are masked, and a canary or protected line yields `fallback`.
         """
         if not text:
             return text or ""
@@ -415,43 +337,13 @@ class OutputGuard:
 class StreamGuard:
     """Hold-back window over live worker tokens.
 
-    Tokens are not relayed the instant they arrive: they wait in `pending`
-    until at least `hold` characters have accumulated *behind* them, and the
-    part that has cleared the window is masked and emitted at a sentence or
-    line boundary. A withhold-tier finding anywhere in what has streamed stops
-    further emission entirely — the closing item then replaces the client's
-    buffer with the guarded (or withheld) text, which it always did; what is
-    new is that a block-tier value no longer sits on screen in the meantime.
-
-    **Masking is done against a context window, not against the chunk.** This
-    is the part that is easy to get wrong, and getting it wrong leaks exactly
-    the values the catalogue exists to find:
-
-      * Half the shapes are *context-gated* — a bare date is only a date of
-        birth because "DOB" sits within thirty characters of it. The release
-        point prefers a sentence boundary, which is precisely where that
-        keyword sits, so masking the chunk alone left `1990-01-02` in the clear
-        after `…the applicant's DOB. ` had already been emitted.
-      * A multi-token value straddles the cut. `customer Sarah Kim` split
-        across the boundary matched nothing in either half.
-
-    So the guard keeps the last `hold` characters of *already emitted* text as
-    context, scans `context + pending` as one buffer, and refuses to release
-    into any span a finding occupies — the release point is clamped back to the
-    start of the earliest finding that extends past it. Nothing is emitted
-    until the guard has seen the whole of every value inside it.
-
-    The scan window is bounded (context plus pending, both bounded by `hold`
-    and its fallback multiple) so the per-token cost does not grow with the
-    length of the answer.
+    Masks against `context + pending`, never the chunk alone: context-gated shapes and values
+    straddling the cut would otherwise leak. The release point is clamped back to the start of
+    any finding extending past it, and a withhold-tier finding anywhere stops emission.
     """
 
-    #: The catalogue's longest contiguous shape is a private key block, which
-    #: `stream_should_hold` catches on its `-----BEGIN` marker instead. Of the
-    #: rest, `github_pat_`/`gh?_` tokens and JWTs are the longest at up to ~260
-    #: characters, so a hold below that cannot see one whole. The clamping
-    #: above is what makes a smaller window safe anyway: a value the guard can
-    #: only partly see is a value it will not release.
+    #: `github_pat_` tokens and JWTs reach ~260 chars (private-key blocks are caught on
+    #: `-----BEGIN` instead). A smaller hold is still safe: partly-seen values are never released.
     LONGEST_SHAPE_HINT = 260
 
     def __init__(self, guard: OutputGuard, hold: int = 160):
@@ -480,15 +372,9 @@ class StreamGuard:
         if cut < 0 and surplus > 3 * self._hold:
             cut = window.rfind(" ")
         if cut < 0:
-            # A reply with no line, sentence or word boundary — a long base64
-            # blob, minified output, CJK prose — must not grow the buffer
-            # without limit: the guard rescans `context + pending` on every
-            # token, so an unbounded buffer makes the whole stream quadratic
-            # (measured at ~16 seconds of pure CPU for a 24000-character
-            # single-line reply). Past this ceiling the release point is the
-            # window itself. Cutting mid-token is safe rather than merely
-            # tolerable: `_release` clamps out of any value it can only partly
-            # see, and the closing item is what the client renders in the end.
+            # No line, sentence or word boundary (base64 blob, minified output, CJK prose):
+            # rescanning an unbounded buffer per token goes quadratic, so past this ceiling
+            # cut mid-token — safe, because `_release` clamps out any partly-seen value.
             if surplus <= 4 * self._hold:
                 return ""
             cut = surplus - 1
@@ -497,8 +383,7 @@ class StreamGuard:
     def flush(self) -> str:
         """Emit whatever remains once the stream has ended.
 
-        No clamping here: the stream has ended, so a finding that extends past
-        the release point cannot grow any further and masking it is correct.
+        No clamping: nothing can grow further once the stream ends, so masking it all is correct.
         """
         if self.suppressed or not self._pending:
             return ""
@@ -507,17 +392,8 @@ class StreamGuard:
     def _release(self, count: int, clamp: bool = True) -> str:
         """Emit the first `count` characters of `pending`, masked in context.
 
-        `self._context` holds the **already-masked** tail of what went out, so
-        two properties hold together and make the offset arithmetic sound:
-
-          * a context word that gated a finding is still in the buffer, so the
-            finding is still found;
-          * no finding can *start* inside the context. Findings entirely
-            within it were masked to placeholders when they were emitted, and
-            no shape matches a placeholder; findings straddling the release
-            point are clamped away below rather than half-emitted. By
-            induction every finding starts at or after the context, so
-            subtracting the context length gives a valid span in `pending`.
+        `_context` is the already-masked tail of what went out, so a gating word is still present
+        and no finding can *start* inside it, so `start - offset` is a valid span in `pending`.
         """
         buffer = self._context + self._pending
         offset = len(self._context)

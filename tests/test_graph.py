@@ -1,12 +1,17 @@
 """End-to-end pipeline tests over the compiled graph with stub services."""
 
+from datetime import datetime, timedelta, timezone
+
+from agent_governance import review_queue as rq
 from agent_governance.rbac import DENIED_MESSAGE
 from helpers import StubGuardrails, StubRouter, StubWorkers, invoke, resume
+from helpers import StubReviews as _Reviews
 
-from supervisor.dispatch import WorkerResponse
-from supervisor.guardrails import GuardrailResult
-from supervisor.nodes import ESCALATION_MESSAGE
+from supervisor import messages as msg
+from supervisor.guardrail_engine import GuardrailResult
+from supervisor.messages import ESCALATION_MESSAGE
 from supervisor.routing import RouteResult
+from supervisor.worker_client import WorkerResponse
 
 
 def test_rbac_denied_is_generic_and_never_reaches_worker(make_graph):
@@ -44,11 +49,8 @@ def test_refusal_reads_as_sentences_whatever_punctuation_the_reason_carries(make
 
 
 def test_underspecified_request_asks_instead_of_blocking_or_dispatching(make_graph):
-    """The screen recognised the subject but not the deliverable.
-
-    Neither of the two things it must not do: no refusal, and no worker call on a
-    guess about what was wanted.
-    """
+    """The screen recognised the subject but not the deliverable: neither a refusal nor a
+    worker call on a guess about what was wanted."""
     question = "Do you want a user story for password reset, or the acceptance criteria?"
     guardrails = StubGuardrails(
         GuardrailResult(True, "semantic", "underspecified: ...", clarification=question)
@@ -66,11 +68,8 @@ def test_underspecified_request_asks_instead_of_blocking_or_dispatching(make_gra
 
 
 def test_both_clarifying_stages_share_one_escalation_limit(make_graph):
-    """Two stages can now ask, so neither may hold its own budget.
-
-    With a counter each they would take turns and the limit would never be
-    reached — the user answers questions forever instead of reaching a human.
-    """
+    """Two stages can now ask, so neither may hold its own budget: with a counter each they
+    would take turns and the user answers questions forever instead of reaching a human."""
     question = "Which requirements artifact do you need?"
     guardrails = StubGuardrails(
         GuardrailResult(True, "semantic", "underspecified: ...", clarification=question)
@@ -119,7 +118,9 @@ def test_how_are_you_is_answered_as_a_question_not_as_a_greeting(make_graph):
     # It was classified as a greeting and got "Hello — I'm the Supervisor…" back,
     # which answers something the user did not ask.
     guardrails = StubGuardrails(
-        GuardrailResult(True, "small_talk", "how_are_you, no domain intent", small_talk="how_are_you")
+        GuardrailResult(
+            True, "small_talk", "how_are_you, no domain intent", small_talk="how_are_you"
+        )
     )
     graph, services = make_graph(guardrails=guardrails)
     text = invoke(graph, "how are you", thread="hru")["final_text"]
@@ -132,12 +133,8 @@ def test_how_are_you_is_answered_as_a_question_not_as_a_greeting(make_graph):
 
 
 def test_repeating_the_same_small_talk_does_not_repeat_the_same_sentence(make_graph):
-    """Three "hi"s must not produce the same line three times.
-
-    Verbatim repetition is the specific thing that reads as broken — the input is
-    the same but the conversational context is not, so the reply escalates
-    instead: hand back the turn, then offer options, then ask for a real task.
-    """
+    """Three "hi"s must not produce the same line three times: verbatim repetition is what
+    reads as broken, so the reply escalates — hand back the turn, offer options, then ask."""
     guardrails = StubGuardrails(
         GuardrailResult(True, "small_talk", "greeting, no domain intent", small_talk="greeting")
     )
@@ -258,12 +255,8 @@ def test_escalates_after_clarification_limit(make_graph):
 
 
 def test_approval_gate_interrupts_then_resumes_without_recalling_the_worker(make_graph):
-    """A staged artifact suspends the graph until a human answers.
-
-    `interrupt()` pauses *inside* dispatch, so resuming continues from that
-    point. The worker is called once, not twice — the old flow returned and
-    re-entered the whole pipeline, which re-invoked it.
-    """
+    """A staged artifact suspends the graph until a human answers: `interrupt()` pauses
+    *inside* dispatch, so resuming continues there and the worker is called once, not twice."""
     workers = StubWorkers(
         [WorkerResponse(text="Here is the HLD draft.", status="approval_pending", stage="HLD")]
     )
@@ -307,12 +300,8 @@ def test_rejecting_a_staged_artifact_discards_it(make_graph):
 
 
 def test_approval_needs_the_producing_agents_permission(make_graph):
-    """An approval is bound to the agent that produced the artifact.
-
-    Here the caller may *use* the Requirement Agent and reaches its staged
-    HLD, but holds no approve grant for it. Signing off must fail — access and
-    approval are separate permissions.
-    """
+    """An approval is bound to the agent that produced the artifact: the caller may *use*
+    the Requirement Agent but holds no approve grant — access and approval are separate."""
     workers = StubWorkers(
         [WorkerResponse(text="Here is the HLD draft.", status="approval_pending", stage="HLD")]
     )
@@ -384,12 +373,8 @@ def test_rejecting_needs_no_approve_permission(make_graph):
 
 
 def test_worker_call_carries_the_correlation_set(make_graph):
-    """§1.10 — every request carries the correlation fields, including this one.
-
-    Without them the worker's own MLflow traces are orphans: a support question
-    about one answer cannot be followed from the calling UI through to the agent
-    that wrote it.
-    """
+    """§1.10 — every request carries the correlation fields. Without them the worker's own
+    MLflow traces are orphans and an answer cannot be traced from the calling UI onward."""
     graph, services = make_graph()
     invoke(graph, "Write an HLD", thread="conv-8")
 
@@ -416,3 +401,155 @@ def test_worker_exception_is_contained(make_graph):
     result = invoke(graph, "Write an HLD")
     assert result["outcome"] == "error"
     assert services.audit.records[0]["decision_trail"][-1]["decision"] == "error"
+
+
+# ── Session lifetime (§05 Stage 04) ──────────────────────────────────────────
+#
+# The RBAC gate's expiry check. State is seeded through `update_state` after one real
+# turn, so the second turn meets the checkpoint an abandoned conversation would have.
+
+
+def _config(thread="t1"):
+    return {"configurable": {"thread_id": thread}}
+
+
+def _stale_iso(days: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def test_an_idle_conversation_with_carried_state_expires_and_is_cleared(make_graph):
+    graph, _ = make_graph()
+    invoke(graph, "Write user stories for the login feature on product line alpha")
+    graph.update_state(
+        _config(),
+        {
+            "session_last_active_at": _stale_iso(8),
+            "session_context": {"product_line": "alpha"},
+            "pending_clarification": "Which environment?",
+            "clarification_count": 1,
+            "deferred_request": {"text": "and also the LLD", "asked_at": "r1"},
+        },
+        as_node="respond",
+    )
+    result = invoke(graph, "and now the acceptance criteria")
+    assert result["outcome"] == "expired"
+    assert result["final_text"] == msg.SESSION_EXPIRED_MESSAGE
+    assert result["session_context"] == {}
+    assert result["pending_clarification"] is None
+    assert result["clarification_count"] == 0
+    assert result["deferred_request"] is None
+    assert any(
+        e["stage"] == "session" and e["decision"] == "expired" for e in result["audit_trail"]
+    )
+
+
+def test_an_idle_conversation_with_nothing_carried_just_restarts_its_clock(make_graph):
+    graph, _ = make_graph()
+    invoke(graph, "Write user stories for the login feature on product line alpha")
+    stale = _stale_iso(8)
+    graph.update_state(
+        _config(),
+        {
+            "session_last_active_at": stale,
+            "session_started_at": stale,
+            "session_context": {},
+            "pending_clarification": None,
+            "pending_approval": None,
+            "open_review": None,
+            "session_notes": [],
+            "deferred_request": None,
+        },
+        as_node="respond",
+    )
+    result = invoke(graph, "Write user stories for the checkout feature on product line alpha")
+    assert result["outcome"] != "expired"
+    assert result["session_started_at"] != stale
+
+
+def test_a_conversation_touched_recently_is_not_expired_however_old_it_is(make_graph):
+    graph, _ = make_graph()
+    invoke(graph, "Write user stories for the login feature on product line alpha")
+    graph.update_state(
+        _config(),
+        {
+            "session_started_at": _stale_iso(30),
+            "session_last_active_at": _stale_iso(0.01),
+            "session_context": {"product_line": "alpha"},
+        },
+        as_node="respond",
+    )
+    result = invoke(graph, "and the acceptance criteria")
+    assert result["outcome"] != "expired"
+
+
+# ── Terminal review state (§05 Stage 03/04) ──────────────────────────────────
+
+
+def _seed_open_review(graph, services, kind):
+    invoke(graph, "Write user stories for the login feature on product line alpha")
+    review = services.reviews.open_review(kind=kind, conversation_id="t1", reason="test")
+    graph.update_state(
+        _config(), {"open_review": {"ref": review.ref, "kind": kind}}, as_node="respond"
+    )
+    return review
+
+
+def test_an_open_escalation_holds_every_later_turn(make_graph):
+    graph, services = make_graph()
+    _seed_open_review(graph, services, rq.ESCALATION)
+    result = invoke(graph, "Write user stories for the checkout feature")
+    assert result["outcome"] == "review_pending"
+    assert result["final_text"] == msg.REVIEW_PENDING_MESSAGE
+    assert result["open_review"] is not None
+    assert any(e["stage"] == "review" and e["decision"] == "held" for e in result["audit_trail"])
+
+
+def test_an_open_appeal_does_not_freeze_the_conversation(make_graph):
+    graph, services = make_graph()
+    _seed_open_review(graph, services, rq.APPEAL)
+    result = invoke(graph, "Write user stories for the checkout feature on product line alpha")
+    assert result["outcome"] != "review_pending"
+    assert result["open_review"] is not None  # the appealed request stays with the reviewer
+    assert any(e["stage"] == "review" and e["decision"] == "open" for e in result["audit_trail"])
+
+
+def test_a_resolved_review_releases_the_hold_and_records_who_decided(make_graph):
+    graph, services = make_graph()
+    review = _seed_open_review(graph, services, rq.ESCALATION)
+    services.reviews.resolve(review.ref, reviewer="alice", decision=rq.UPHOLD, note="scope")
+    result = invoke(graph, "Write user stories for the checkout feature on product line alpha")
+    assert result["outcome"] != "review_pending"
+    assert result["open_review"] is None
+    resolved = [
+        e for e in result["audit_trail"] if e["stage"] == "review" and e["decision"] == "resolved"
+    ]
+    assert resolved and "alice" in resolved[0]["detail"] and "scope" in resolved[0]["detail"]
+
+
+def test_an_unreachable_queue_fails_closed_only_for_a_conversation_with_a_review_open(make_graph):
+    graph, services = make_graph()
+    _seed_open_review(graph, services, rq.ESCALATION)
+    services.reviews.fail = True
+    result = invoke(graph, "Write user stories for the checkout feature")
+    assert result["outcome"] == "error"
+    assert result["final_text"] == msg.REVIEW_UNAVAILABLE_MESSAGE
+    assert any(e["decision"] == "fail_closed" for e in result["audit_trail"])
+
+    # A conversation with nothing open never touches the queue, so the same
+    # outage is invisible to it.
+    fresh, _ = make_graph(reviews=_Reviews(fail=True))
+    ok = invoke(
+        fresh, "Write user stories for the login feature on product line alpha", thread="t9"
+    )
+    assert ok["outcome"] != "error"
+
+
+def test_a_marker_for_a_deleted_review_row_is_cleared_rather_than_locking_forever(make_graph):
+    graph, _ = make_graph()
+    invoke(graph, "Write user stories for the login feature on product line alpha")
+    graph.update_state(
+        _config(), {"open_review": {"ref": "rev_gone", "kind": rq.ESCALATION}}, as_node="respond"
+    )
+    result = invoke(graph, "Write user stories for the checkout feature on product line alpha")
+    assert result["outcome"] != "review_pending"
+    assert result["open_review"] is None

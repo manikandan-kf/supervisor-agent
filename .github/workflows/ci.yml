@@ -6,7 +6,11 @@
 #   * `ruff check --select S` — the SAST pass.
 #   * `pytest` — the governance contract (the supervisor's tests) and the
 #     shared library's own tests, including the fault-injection and
-#     negative-authorization cases.
+#     negative-authorization cases, and the policy corpus in
+#     `src/supervisor/config/policy_suite.yaml`. That corpus also gates
+#     `publish_config.py --apply`, which is the path a guardrails change takes
+#     to a live endpoint without passing here at all — same evaluator, same
+#     cases, so the two cannot disagree.
 #   * the dependency tree — for an agent, most of the attack surface is code
 #     nobody here wrote (OWASP Top 10 for Agentic Applications 2026, ASI04).
 #
@@ -54,10 +58,25 @@ jobs:
       - name: Lint and SAST (ruff)
         run: |
           ruff check . --output-format=github
+          ruff format --check .
           ruff check . --output-format=json > ruff-findings.json || true
 
+      - name: Types (gated on the shared library)
+        # The library is clean and every agent on the platform installs it, so
+        # it is a release gate today. See [tool.mypy] in pyproject.toml.
+        run: mypy libs/agent_governance/src/agent_governance
+
+      - name: Types (reported on the supervisor package)
+        # Not a gate yet — the remaining findings are mostly MLflow stub gaps.
+        # Reported so the count is visible in every run and can only go down.
+        continue-on-error: true
+        run: mypy src/supervisor | tee mypy-supervisor.txt
+
       - name: Tests
-        run: pytest -q --junitxml=pytest-results.xml
+        run: >
+          pytest -q --junitxml=pytest-results.xml
+          --cov=src/supervisor --cov=libs/agent_governance/src/agent_governance
+          --cov-report=term --cov-report=xml:coverage.xml
 
       - name: Build the shared library wheel
         # The same command `databricks bundle deploy` runs. A wheel that does
@@ -72,6 +91,8 @@ jobs:
           name: supervisor-evidence-${{ github.run_number }}
           path: |
             pytest-results.xml
+            coverage.xml
+            mypy-supervisor.txt
             ruff-findings.json
             libs/agent_governance/dist/*.whl
           retention-days: 90
@@ -115,8 +136,16 @@ jobs:
         run: cyclonedx-py environment --output-format JSON --outfile sbom.json
 
       - name: Secret scan (gitleaks)
+        # A **gate**, unlike the vulnerability scan above. The two were both
+        # advisory and they should not have been: a new CVE needs a human to
+        # decide severity and an owner to triage it, which is the open decision
+        # the step above is waiting on — but a credential committed to history
+        # needs no triage to be wrong, and the remedy (rotate, then rewrite) only
+        # gets more expensive the further it travels. Nothing legitimate in this
+        # repository trips it: the synthetic values the redaction tests need live
+        # in `libs/agent_governance/tests/fixtures.py`, which is why they are
+        # named there rather than inline.
         uses: gitleaks/gitleaks-action@v2
-        continue-on-error: true
         env:
           GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
           GITLEAKS_ENABLE_SUMMARY: "true"

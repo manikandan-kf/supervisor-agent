@@ -1,11 +1,8 @@
 """The sensitive-data catalogue — what it must catch, what it must not.
 
-`sensitive.py` is read by three boundaries (the persistence redactor, the
-worker relay, the output guard), so a shape pinned here is pinned for all
-three. The attack strings are worst-case worker replies; the benign strings
-are the SDLC prose this platform carries every day, and every one of them must
-come back untouched — a placeholder in an HLD a human was meant to read is an
-over-redaction failure, and it costs the reader more than the masking saved.
+`sensitive.py` is read by three boundaries (persistence redactor, worker relay, output
+guard), so a shape pinned here is pinned for all three. Attack strings are worst-case worker
+replies; benign ones are SDLC prose, and over-redacting an HLD costs more than it saves.
 """
 
 from __future__ import annotations
@@ -50,7 +47,14 @@ def test_iban_mod97_and_country_length():
 
 def test_ssn_issuance_rules():
     assert ssn_valid("123-45-6789"), "the sample number is still masked — over-masking is free"
-    for bad in ("000-12-3456", "666-12-3456", "912-34-5678", "123-00-4567", "123-45-0000", "111-11-1111"):
+    for bad in (
+        "000-12-3456",
+        "666-12-3456",
+        "912-34-5678",
+        "123-00-4567",
+        "123-45-0000",
+        "111-11-1111",
+    ):
         assert not ssn_valid(bad), bad
 
 
@@ -87,8 +91,7 @@ def test_nino_prefix_rules():
         (FAKE_GITHUB_TOKEN, {"github-token"}),
         # An AWS key pair, the secret in prose next to its context word.
         (
-            f"AWS_ACCESS_KEY_ID={FAKE_AWS_KEY_ID}; the aws secret is "
-            f"{FAKE_AWS_SECRET}",
+            f"AWS_ACCESS_KEY_ID={FAKE_AWS_KEY_ID}; the aws secret is {FAKE_AWS_SECRET}",
             {"aws-key-id", "aws-secret-key"},
         ),
         # A record number, a diagnosis and a medication.
@@ -206,10 +209,8 @@ def test_a_person_needs_a_role_word():
 @pytest.mark.parametrize(
     "fixture",
     [
-        # The form a name actually arrives in — a dict or JSON literal, where
-        # the closing quote of the key sits before the colon. A single optional
-        # quote in the separator never matched this, and a name in that form
-        # then travelled through the whole stack in the clear.
+        # The form a name actually arrives in — a dict or JSON literal, where the closing
+        # quote of the key sits before the colon, which the old separator never matched.
         "customer = {'name': 'John Mercer', 'city': 'Leeds'}",
         '{"customer": "Jane Whitfield"}',
         "{'patient': \"Tom Reyes\"}",
@@ -220,3 +221,63 @@ def test_a_person_needs_a_role_word():
 )
 def test_a_name_in_a_quoted_key_fixture_is_found(fixture):
     assert "person" in labels(fixture), f"{fixture!r} -> {labels(fixture)}"
+
+
+# ── the same quoted-key form, for the other three key-anchored shapes ────────
+#
+# `person` was fixed for this form and these three were not, so a worker reply that
+# serialized a record as JSON lost the diagnosis, record id and credential while keeping
+# the name. `patient-record-id` is health_id, a *withhold* tier — a block that never fired.
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    [
+        '{"DB_PASSWORD": "pr0dPassw0rd!", "LOG_LEVEL": "info"}',
+        "{'api_key': 's3cr3tValue123456'}",
+        "DB_PASSWORD=pr0dPassw0rd!",
+        "DB_PASSWORD: pr0dPassw0rd!",
+    ],
+)
+def test_a_secret_assignment_survives_json_quoting(fixture):
+    assert "secret-assignment" in labels(fixture), f"{fixture!r} -> {labels(fixture)}"
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    [
+        '{"patient": "Tom Reyes", "diagnosis": "HIV positive"}',
+        "{'diagnosis': 'Type 2 Diabetes'}",
+        "{diagnosis: 'Type 2 Diabetes'}",
+        "diagnosed with Type 2 Diabetes",
+    ],
+)
+def test_a_health_condition_survives_json_quoting(fixture):
+    assert "health-condition" in labels(fixture), f"{fixture!r} -> {labels(fixture)}"
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    [
+        '{"patient": "Tom Reyes", "diagnosis": "HIV positive", "record_id": 445521}',
+        "{'patient': 'Tom Reyes', 'record_id': 445521}",
+        "{patient: 'Tom Reyes', record_id: 445521}",
+    ],
+)
+def test_a_patient_record_id_survives_json_quoting(fixture):
+    assert "patient-record-id" in labels(fixture), f"{fixture!r} -> {labels(fixture)}"
+
+
+@pytest.mark.parametrize(
+    "benign",
+    [
+        # A reference to a secret, not one — the JSON form of the cases
+        # `_SECRET_REFERENCE` already admits. Widening the separator must not
+        # widen what counts as a value.
+        '{"password": "${DB_PASSWORD}"}',
+        '{"auth": "bearer"}',
+        '{"patient id": "field"}',
+    ],
+)
+def test_quoting_does_not_widen_what_counts_as_a_value(benign):
+    assert labels(benign) == [], f"{benign!r} -> {labels(benign)}"

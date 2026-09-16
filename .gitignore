@@ -30,3 +30,9 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+# Coverage and type-check caches (CI uploads coverage.xml as an artifact).
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/

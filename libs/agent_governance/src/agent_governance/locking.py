@@ -1,53 +1,12 @@
 """One execution per conversation thread at a time.
 
-Model Serving does not serialize requests by conversation. An endpoint runs
-several replicas, each replica several worker processes, and every request
-goes to whichever has capacity — nothing routes on the payload. So two turns
-arriving on one conversation (a double-submit, an impatient retry, two browser
-tabs on the same chat) both load the same checkpoint, both run the gates, and
-both write back. The loser's write silently replaces the winner's, so a
-clarification can be answered against a state that no longer exists and an
-approval gate can be resolved twice. LangGraph Platform enforces one run per
-thread for its own deployments ("double texting" — reject, enqueue, interrupt
-or rollback); for a graph served anywhere else nothing does, which is why
-every agent on this platform takes this lock around its graph run.
-
-**Postgres advisory locks, not a lease table.** An advisory lock is held by the
-database *session*, which makes the crash behaviour correct for free: if a
-serving replica is killed mid-turn its connection drops and Postgres releases
-the lock immediately. A lease row would need a TTL, and any TTL is either long
-enough to wedge a conversation after a crash or short enough to expire under a
-slow worker call. The lock costs one round-trip against a turn that already
-spends seconds in model calls.
-
-**64-bit key space, namespaced.** The single-bigint `pg_try_advisory_lock(key)`
-form, with the key derived from a namespace plus the thread id. A two-integer
-form would leave 32 bits for the thread — a birthday bound of ~50% collision by
-~77,000 distinct conversations, so at enterprise scale colliding pairs would be
-constant and each one silently serializes two unrelated users' turns against
-each other. 64 bits pushes that bound past five billion conversations; the
-namespace keeps one agent's keys disjoint in expectation from any other
-advisory-lock user sharing the instance.
-
-**Under contention** the second turn polls for up to `timeout` seconds and is
-then refused rather than run concurrently: `thread_lock` yields `False`, and
-the caller answers with its own busy message. A refusal the user can act on
-("your previous message is still working") is strictly better than two turns
-racing to overwrite each other.
-
-**Where it degrades, stated plainly.** With no connection source (local
-development, the in-memory fallbacks) the lock is a per-process
-`threading.Lock`: it covers concurrent requests inside one worker process, not
-the several worker processes a serving replica runs. That is the same shape as
-the in-memory checkpointer it arrives with — with no shared database there is
-nothing to serialize *through*. The Postgres path is the deployed path.
-
-Acquisition failing for an *infrastructural* reason (pool exhausted, connection
-error) **fails open** with a warning, and the turn runs unserialized.
-Deliberate: failing closed would let an agent's own pool sizing refuse governed
-traffic, and the condition being protected against — two turns on the *same*
-conversation — is rare next to the many-threads-one-pool case that would trip
-it. Contention itself always fails closed; only the plumbing fails open.
+Model Serving routes nothing on the payload, so two turns on one conversation (double-submit,
+retry, two tabs) both load the checkpoint and both write back; the loser silently overwrites the
+winner. Postgres advisory locks, not a lease table: session-held, so a killed replica releases at
+once, while any lease TTL either wedges a conversation or expires under a slow worker call. Keys
+are 64-bit and namespaced (32 bits collide by ~77k conversations). Contention fails closed after
+`timeout`; plumbing failure fails open with a warning — pool sizing must not refuse governed
+traffic. With no connection source the lock is per-process only (the local dev shape).
 """
 
 from __future__ import annotations
@@ -57,7 +16,7 @@ import hashlib
 import logging
 import threading
 import time
-from typing import Callable, Iterator, Optional
+from typing import Any, Callable, ContextManager, Iterator, Optional, cast
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +27,8 @@ _local_guard = threading.Lock()
 def thread_key(thread_id: str, namespace: str = "agent") -> int:
     """A stable signed 64-bit advisory-lock key for one thread id.
 
-    Signed, because `pg_advisory_lock(key bigint)` takes `bigint`. A collision
-    still only serializes two unrelated conversations against each other —
-    latency, never correctness — but at 64 bits that stays a curiosity instead
-    of a fleet-wide constant. `namespace` is the agent's tag, mixed in so that
-    two agents sharing one Lakebase instance live in different regions of the
-    key space.
+    Signed because `pg_advisory_lock` takes `bigint`. A collision only serializes two unrelated
+    conversations (latency, not correctness); `namespace` keeps agents sharing an instance apart.
     """
     digest = hashlib.sha256(f"{namespace}\x00{thread_id}".encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "big", signed=True)
@@ -115,12 +70,9 @@ def _acquire(conn, objid: int, timeout: float, poll: float) -> bool:
 def _release(conn, objid: int, thread_id: str) -> None:
     """Release the advisory lock, or destroy the connection holding it.
 
-    Mandatory, not tidiness: the lock is session-scoped and `psycopg_pool` only
-    rolls back on return, which does not release it. A leaked lock would be
-    inherited by the next borrower of this pooled connection and wedge that
-    thread for the life of the process — so if the unlock statement itself
-    fails, the connection is closed instead. Ending the session is what
-    guarantees Postgres drops everything it held.
+    The lock is session-scoped and `psycopg_pool` only rolls back on return, so a leaked lock
+    would be inherited by the next borrower and wedge that thread for the life of the process;
+    if the unlock fails, closing the connection is what guarantees Postgres drops it.
     """
     try:
         with conn.cursor() as cur:
@@ -147,10 +99,9 @@ def thread_lock(
 ) -> Iterator[bool]:
     """Hold the execution lock for one conversation. Yields whether it was taken.
 
-    `connection_source` is a zero-arg callable yielding a context-managed
-    Postgres connection (`lakebase.lock_connection_source`), or None for the
-    per-process fallback. A caller handed `False` must not run the graph — that
-    is the entire point — and should answer with a busy message instead.
+    `connection_source` is a zero-arg callable yielding a context-managed Postgres connection
+    (`lakebase.lock_connection_source`), or None for the per-process fallback. A caller handed
+    `False` must not run the graph and should answer with a busy message instead.
     """
     if not enabled or not thread_id:
         yield True
@@ -164,7 +115,9 @@ def thread_lock(
     objid = thread_key(thread_id, namespace)
     with contextlib.ExitStack() as stack:
         try:
-            conn = stack.enter_context(connection_source())
+            # `connection_source` is caller-supplied and untyped; the cast documents the
+            # contract the docstring states rather than widening it.
+            conn: Any = stack.enter_context(cast(ContextManager[Any], connection_source()))
             acquired = _acquire(conn, objid, timeout, poll)
         except Exception:
             # Plumbing, not contention. Fail open — see the module docstring.

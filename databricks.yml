@@ -1,19 +1,22 @@
 # Databricks Asset Bundle for the Supervisor Agent.
 #
-# What the bundle owns declaratively:
+# This file holds only what is true for the whole bundle: its name, the
+# variables every target reuses, how the shared library is built, what is
+# synced, and the targets themselves. Each resource lives in its own file under
+# resources/ and is picked up by the `include` glob below, so adding a resource
+# is a new file rather than another hundred lines here:
 #
-#   * the Unity Catalog schema this environment's model, prompts and
-#     configuration live in
-#   * the shared governance library, built as a wheel at deploy time
-#   * a job that registers the prompts, seeds the governed configuration,
-#     publishes the library, and then logs, registers and deploys the agent
+#   resources/schema.yml      the Unity Catalog schema this environment owns
+#   resources/deploy_job.yml  the job that registers, publishes and deploys
+#   resources/lakebase.yml    shared infrastructure — disabled, see the file
 #
-# What it does NOT own: the serving endpoint. `databricks.agents.deploy()`
-# creates that imperatively, together with the auth passthrough that grants the
-# endpoint's service principal access to the declared MLflow resources. Building
-# it as a `model_serving_endpoints` resource instead would lose that passthrough,
-# so the endpoint stays imperative and `bundle destroy` will not remove it —
-# delete it with `databricks serving-endpoints delete <name>` first.
+# What the bundle does NOT own: the serving endpoint. log_and_deploy.py creates
+# it imperatively — `databricks.agents.deploy()` by default, or the Model
+# Serving SDK when `deploy_method: serving-api` — right after registering the
+# model version it must serve. A declarative `model_serving_endpoints` resource
+# would have to name a version that does not exist until the job runs. So the
+# endpoint survives `bundle destroy`: remove it with
+# `databricks serving-endpoints delete <name>` first.
 #
 #   databricks bundle validate -t dev
 #   databricks bundle deploy   -t dev
@@ -23,6 +26,12 @@
 
 bundle:
   name: langgraph-supervisor
+
+# Every *.yml under resources/ is merged into this configuration. A file may
+# declare `resources:` and nothing else; one that is entirely commented out
+# contributes nothing, which is how resources/lakebase.yml ships disabled.
+include:
+  - resources/*.yml
 
 # ── One deployment per environment, sharing nothing ─────────────────────────
 #
@@ -88,10 +97,10 @@ variables:
   lakebase_instance:
     description: >-
       Lakebase database instance backing durable conversation memory, long-term
-      memory, the governed configuration table, the review queue and the
-      Postgres audit sink. Create it first (DEPLOYMENT.md §5); declaring one
-      that does not exist fails the model registration. One instance serves
-      every environment by default — they are separated by lakebase_schema.
+      memory, the governed config table, the review queue and the Postgres audit
+      sink. Create it first (DEPLOYMENT.md §5, or enable resources/lakebase.yml);
+      declaring one that does not exist fails the model registration. One
+      instance serves every environment — they are separated by lakebase_schema.
     default: supervisor-memory
   lakebase_schema:
     description: >-
@@ -100,6 +109,14 @@ variables:
       issues CREATE SCHEMA IF NOT EXISTS on every pool it opens). Empty means
       `public`, the single-environment shape.
     default: supervisor_${bundle.target}
+  deploy_method:
+    description: >-
+      How log_and_deploy.py creates the endpoint. 'agents' calls
+      databricks.agents.deploy(); 'serving-api' uses the Model Serving SDK
+      directly — same endpoint name, same tracing setup, no Review App entry.
+      Switch to 'serving-api' in a workspace where agents.deploy() fails
+      (Agent Framework registration or the AI Gateway check at create time).
+    default: agents
   platform_schema:
     description: >-
       The platform-wide schema shared by EVERY agent — not an environment
@@ -135,102 +152,6 @@ sync:
     - libs/**
     - libs/agent_governance/dist/*.whl
     - requirements.txt
-
-resources:
-  schemas:
-    supervisor_schema:
-      catalog_name: ${var.catalog}
-      name: ${var.schema}
-      comment: Supervisor Agent — model, prompts, governed configuration.
-
-  jobs:
-    supervisor_agent_deploy:
-      name: supervisor-agent-deploy
-      # The schema must exist before the prompts or the model land in it. The
-      # bundle creates it at deploy time, before the job is ever run.
-      #
-      # The paths below are built from ${var.catalog}/${var.schema}, the same
-      # variables the schema resource uses, so the two always agree.
-      tasks:
-        - task_key: register_prompts
-          environment_key: default
-          spark_python_task:
-            python_file: deploy/register_prompts.py
-            parameters:
-              - "--catalog-schema"
-              - "${var.catalog}.${var.schema}"
-              - "--alias"
-              - "${bundle.target}"
-
-        # Seeds the governed configuration table from the bundled YAML, so a
-        # fresh workspace has agents/rbac/guardrails published before the
-        # endpoint first serves. Idempotent: a document identical to the active
-        # version is skipped. After this, a configuration change is
-        # `deploy/publish_config.py --apply` on its own — no bundle deploy.
-        - task_key: publish_config
-          environment_key: default
-          spark_python_task:
-            python_file: deploy/publish_config.py
-            parameters:
-              - "--apply"
-              - "--lakebase-instance"
-              - "${var.lakebase_instance}"
-              - "--lakebase-schema"
-              - "${var.lakebase_schema}"
-              - "-m"
-              - "seeded by supervisor-agent-deploy (${bundle.target})"
-
-        # Publishes the governance wheel this deploy was built with to the
-        # platform volume, for the worker agents. Idempotent per version; the
-        # supervisor's own deploy does not depend on it.
-        - task_key: publish_library
-          environment_key: default
-          spark_python_task:
-            python_file: deploy/publish_library.py
-            parameters:
-              - "--catalog"
-              - "${var.catalog}"
-              - "--schema"
-              - "${var.platform_schema}"
-              - "--volume"
-              - "${var.library_volume}"
-
-        - task_key: log_and_deploy
-          depends_on:
-            - task_key: register_prompts
-            - task_key: publish_config
-          environment_key: default
-          spark_python_task:
-            python_file: deploy/log_and_deploy.py
-            parameters:
-              - "--uc-model"
-              - "${var.catalog}.${var.schema}.${var.model_name}"
-              - "--experiment"
-              - "${var.experiment}"
-              - "--routing-endpoint"
-              - "${var.routing_llm_endpoint}"
-              - "--environment"
-              - "${bundle.target}"
-              - "--prompt-catalog-schema"
-              - "${var.catalog}.${var.schema}"
-              - "--prompt-alias"
-              - "${bundle.target}"
-              - "--workers"
-              - "${var.workers}"
-              - "--lakebase-instance"
-              - "${var.lakebase_instance}"
-              - "--lakebase-schema"
-              - "${var.lakebase_schema}"
-              - "--multi-model"
-              - "${var.multi_model_enabled}"
-
-      environments:
-        - environment_key: default
-          spec:
-            client: "2"
-            dependencies:
-              - -r requirements.txt
-              - ./libs/agent_governance/dist/*.whl
 
 targets:
   # A deployed environment on Databricks, with its own UC schema, its own

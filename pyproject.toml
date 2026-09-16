@@ -49,6 +49,9 @@ dependencies = [
 dev = [
     "ruff==0.14.6",
     "pytest==9.1.1",
+    "pytest-cov==7.0.0",
+    "mypy==1.18.2",
+    "types-PyYAML==6.0.12.20250915",
 ]
 
 [tool.setuptools.dynamic]
@@ -97,7 +100,7 @@ known-first-party = ["supervisor"]
 # ── S608: SQL built by interpolating a table name ────────────────────────────
 # SQL cannot parameterize an *identifier*, so a table name has to reach the
 # statement as text. Every value in these statements is bound with `%s`; only
-# the identifier is interpolated, and `agent_governance.sql.safe_identifier`
+# the identifier is interpolated, and `agent_governance.lakebase.safe_identifier`
 # validates it at construction against
 # `^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*){0,2}$`, so nothing carrying
 # a quote, a semicolon, whitespace or a comment marker can reach these strings.
@@ -117,3 +120,30 @@ known-first-party = ["supervisor"]
 # already exists before registering — where the failure genuinely does not
 # matter and there is nowhere useful to report it.
 "deploy/register_prompts.py" = ["S110"]
+
+# ── mypy: static types ───────────────────────────────────────────────────────
+#
+#     mypy libs/agent_governance/src/agent_governance     # gated in CI
+#     mypy src/supervisor                                 # reported, not gated
+#
+# Gated on the shared library and not (yet) on the supervisor package, which is
+# a deliberate phase rather than an oversight. The library is the smaller tree,
+# it is the one every agent on the platform installs, and it is clean today —
+# so it can be a release gate now. `src/supervisor` still has findings, most of
+# them where MLflow's `ResponsesAgent` types are looser than the runtime
+# contract; CI reports them so the number is visible and can only go down.
+#
+# `ignore_missing_imports` because the Databricks and MLflow packages ship
+# partial stubs and vendoring our own would be a maintenance burden with no
+# safety return.
+[tool.mypy]
+# No `python_version` pin on purpose: pinning it to the 3.11 floor makes mypy
+# parse the *installed* third-party stubs under 3.11 rules, and a dependency
+# whose stubs use 3.12 syntax (numpy does) then fails to parse and stops the
+# run before it checks anything of ours. Checking under whichever interpreter
+# is running is the behaviour that works on both a 3.12 workstation and the
+# 3.11 CI image.
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true

@@ -22,47 +22,17 @@ class WorkerAgent:
     domain_scope: str
     required_context: tuple[str, ...] = ()
     deny_patterns: tuple[str, ...] = ()
-    # Multi-model support: the serving endpoint this agent's
-    # *governance* calls — semantic screen, context resolution, worker
-    # simulation — should use instead of the global routing LLM. Empty means
-    # "use the global endpoint", which is every entry today. Honoured only
-    # when MULTI_MODEL_ENABLED is true; model_provider.get_agent_model owns
-    # that gate. This is NOT the worker's own internal model — that stays the
-    # worker's concern (ASM-03); `endpoint` above is still where a dispatch
-    # actually goes.
+    # Endpoint for this agent's *governance* calls when MULTI_MODEL_ENABLED; empty
+    # means the global routing LLM. Not the worker's own model (ASM-03).
     model: str = ""
     # ── Supervisor-enforced human approval ──────────────────────────────────
-    # Requests to *this* agent that match one of these patterns have their
-    # response staged for human sign-off, whether or not the worker asks for a
-    # gate. Each entry is `{"pattern": <regex>, "reason": <shown to the
-    # approver>}`, the same shape as the guardrails document's deny rules.
-    #
-    # This exists because the approval gate used to depend entirely on a worker
-    # volunteering `custom_outputs.hitl.status == "pending_approval"`. Solution
-    # §04 puts "irreversible actions (deployment steps) behind the
-    # human-in-the-loop approval gate" — a promise that rested on worker
-    # cooperation, so a worker that forgot the flag, was misconfigured or was
-    # compromised simply returned an answer and no gate opened. Declaring the
-    # requirement here moves it into governed configuration the supervisor
-    # enforces, on the same publish path as every other rule.
-    #
-    # Matched against the user's request, not the worker's response: what makes
-    # an action reviewable is what was asked for, and the response is the thing
-    # being reviewed. Patterns should name the *action*, not its subject — see
-    # `agents.yaml` for why "the rollback procedure" must not trip a gate that
-    # "roll back prod" does.
+    # Solution §04: irreversible actions sit behind the approval gate regardless of
+    # whether the worker volunteers `hitl.status`. Matched against the *request*,
+    # naming the action not its subject — see `agents.yaml`. Shape: `{"pattern", "reason"}`.
     approval_patterns: tuple[dict, ...] = ()
-    # Classification only — low | medium | high | critical. Recorded in the
-    # decision trail so a reviewer sees what class of agent produced an
-    # artifact, and so a report can separate high-risk traffic. Deliberately
-    # not wired to any automatic behaviour: a risk *label* driving a hidden
-    # policy is how a governance decision becomes unexplainable. What gates is
-    # `approval_patterns` above, which is explicit.
+    # Classification only (low|medium|high|critical), recorded in the trail. Not wired
+    # to behaviour: a risk *label* driving hidden policy is unexplainable governance.
     risk_level: str = "low"
-    # `supports_hitl` and `stages` used to sit here. Nothing read them: the
-    # staged order a UI shows is that UI's own concern, and a *sequence* is
-    # still something the supervisor never enforces. Declaring
-    # them here implied otherwise, which is worse than not saying it.
 
 
 class AgentRegistry:
@@ -73,9 +43,7 @@ class AgentRegistry:
     def from_mapping(cls, data: dict) -> "AgentRegistry":
         """Build from the parsed agents document.
 
-        The one parsing seam: whether the document came from the bundled YAML
-        or from a row in the governed table (`config_store`), it is interpreted
-        here, so the two sources cannot drift.
+        The one parsing seam for both the bundled YAML and the governed table.
         """
         data = data or {}
         agents = [
@@ -89,7 +57,9 @@ class AgentRegistry:
                 deny_patterns=tuple(row.get("deny_patterns", []) or []),
                 model=str(row.get("model", "") or "").strip(),
                 approval_patterns=tuple(
-                    rule for rule in (row.get("approval_patterns", []) or []) if isinstance(rule, dict)
+                    rule
+                    for rule in (row.get("approval_patterns", []) or [])
+                    if isinstance(rule, dict)
                 ),
                 risk_level=str(row.get("risk_level", "low") or "low").strip().lower(),
             )
@@ -104,16 +74,8 @@ class AgentRegistry:
     def approval_reason(agent: "WorkerAgent | None", query: str) -> str:
         """Why this request to `agent` needs human sign-off, or "" if it does not.
 
-        Deterministic and case-insensitive, evaluated on the user's request. A
-        match is a *requirement*, never a suggestion: the supervisor stages the
-        response regardless of what the worker returned.
-
-        Patterns are compiled per call rather than at construction, unlike the
-        guardrail engine's. This runs once per dispatch against a handful of
-        short patterns, `re` keeps its own compiled cache, and the registry is
-        rebuilt whenever the governed document changes — pre-compiling would
-        add a build step to buy nothing measurable. An unusable pattern cannot
-        reach here anyway: `config_store` compiles every one at publish time.
+        A match is a *requirement*: the response is staged regardless of the worker's
+        reply. Compiled per call — `re` caches, and `config_store` validated at publish.
         """
         if agent is None or not query:
             return ""
@@ -125,10 +87,8 @@ class AgentRegistry:
                 if re.search(pattern, query, flags=re.IGNORECASE):
                     return str(rule.get("reason") or "the request matches an approval rule")
             except re.error:
-                # Belt and braces: a pattern that somehow bypassed publish-time
-                # validation must not take the turn down. Skipping it is the
-                # only safe direction — the alternative is a failed dispatch on
-                # a request that may not have needed a gate at all.
+                # A pattern that bypassed publish-time validation must not take the
+                # turn down; skipping it is the only safe direction.
                 logger.warning(
                     "agent %s has an invalid approval pattern %r — ignored", agent.id, pattern
                 )
@@ -140,8 +100,7 @@ class AgentRegistry:
     def context_keys(self) -> frozenset[str]:
         """Every context key any agent declares it needs.
 
-        The allowlist for long-term memory writes: nothing outside this set was
-        asked for by an agent, so nothing outside it is worth persisting — and
-        persisting it anyway is the memory-poisoning path §04 closes.
+        The long-term memory write allowlist: persisting anything else is the
+        memory-poisoning path §04 closes.
         """
         return frozenset(key for agent in self._agents.values() for key in agent.required_context)

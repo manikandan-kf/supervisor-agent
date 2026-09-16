@@ -11,11 +11,10 @@ shape.
 | `output_guard` | the layer-7 screen: `OutputGuard.screen()` on a reply, `.relay()` on text bound for a model, `.scrub()` on model-written text shown to a user, `StreamGuard` over live tokens |
 | `sanitize` | untrusted text handling: control characters, impersonated turn boundaries, embedded directive frames, size bounds |
 | `deny_rules` | tier-1 deterministic deny patterns and the kill switch, one rule shape for input and output |
-| `prompting` | `untrusted_turn` (JSON-encoded untrusted content in its own turn) and `system_blocks` (cacheable system prompt prefix) |
 | `grounding` | execution claims and citations nothing in the turn backs |
 | `trust` | HMAC signing and verification of entitlements and dispatches — a worker calls `verify_dispatch` |
-| `rbac` | role → agent authorization |
-| `deadline`, `resilience`, `spend` | the turn time budget, bounded retries, and the governance spend ledger |
+| `rbac` | role → agent authorization, and `check_privileges` — the startup check that the governance tables' post-deploy grants were actually applied |
+| `resilience`, `spend` | the turn time budget and the bounded retries inside it, and the governance spend ledger |
 | `audit` | the Postgres decision-trail sink with its tamper-evident hash chain, mirrored onto the MLflow trace |
 | `review_queue` | the appeal / escalation queue: an agent opens and claims, a reviewer surface lists and resolves — same table, same module |
 | `locking` | `thread_lock`: one execution per conversation, over a Postgres advisory lock. Model Serving does not serialize turns by conversation; this does |
@@ -33,11 +32,11 @@ depend on what that agent retrieves, stores and calls.
 | Layer | What the wheel gives you | What stays yours |
 |---|---|---|
 | 1 · Input | `sanitize` (control and bidi characters, impersonated turn boundaries, embedded directive frames, size bounds); `deny_rules` (injection and jailbreak patterns, kill switch) | Payload schema and MIME validation, rate limits and malware scanning — these belong at the front door, ahead of the endpoint |
-| 2 · Prompt | `prompting.system_blocks` (system instructions in a channel user text cannot reach, cacheable prefix); `prompting.untrusted_turn` (untrusted content JSON-encoded in its own turn — context boundaries and role separation); `output_guard.relay` on text bound *for* a model | Your own locked instructions, and keeping them in the system block rather than in a user turn |
+| 2 · Prompt | `sanitize.system_blocks` (system instructions in a channel user text cannot reach, cacheable prefix); `sanitize.untrusted_turn` (untrusted content JSON-encoded in its own turn — context boundaries and role separation); `output_guard.relay` on text bound *for* a model | Your own locked instructions, and keeping them in the system block rather than in a user turn |
 | 3 · Memory | `sensitive.redact_text` before anything is persisted; `lakebase` pools with one Postgres schema per agent and environment (session separation) | The write allowlist, recall narrowing and retention ceiling for the fields *you* store — the supervisor's `LongTermMemory` is the worked example |
 | 4 · Retrieval | `grounding` (claims and citations the turn holds no evidence for); `sanitize.clean_inbound_text` on every retrieved chunk before it reaches a prompt | Source and metadata filtering, trust scoring and freshness — they depend on your index and your permissions |
-| 5 · Tool | `rbac` (role → agent); `trust.verify_dispatch` (act only on a dispatch the supervisor signed); `deadline` and `resilience` (per-call timeout, bounded retries); `spend` (per-turn and per-subject ceilings) | Your tool allowlist, and the LangGraph `interrupt()` gate in front of anything irreversible |
-| 6 · Runtime | `locking.thread_lock` (one execution per conversation); `deadline` (turn budget); `audit` (the decision trail and its hash chain, mirrored onto the MLflow trace) | Loop bounds for your own graph, and a recursion ceiling on it |
+| 5 · Tool | `rbac` (role → agent); `trust.verify_dispatch` (act only on a dispatch the supervisor signed); `resilience` (turn budget, per-call timeout, bounded retries); `spend` (per-turn and per-subject ceilings) | Your tool allowlist, and the LangGraph `interrupt()` gate in front of anything irreversible |
+| 6 · Runtime | `locking.thread_lock` (one execution per conversation); `resilience` (turn budget); `audit` (the decision trail and its hash chain, mirrored onto the MLflow trace) | Loop bounds for your own graph, and a recursion ceiling on it |
 | 7 · Output | `output_guard.screen` / `.scrub` and `StreamGuard` (policy per category — allow, mask, block, escalate — bulk-disclosure threshold, canary and prompt-leak detection); the `sensitive` catalogue; `grounding` cues on unbacked claims | Your response schema, validated by your `ResponsesAgent` contract |
 
 One deliberate absence: there is no fallback-to-a-smaller-model path. A
@@ -73,7 +72,7 @@ environments:
       client: "2"
       dependencies:
         - -r requirements.txt
-        - /Volumes/<catalog>/agent_platform/libs/agent_governance-0.1.0-py3-none-any.whl
+        - /Volumes/<catalog>/agent_platform/libs/agent_governance-0.2.0-py3-none-any.whl
 ```
 
 **2. Its log-and-deploy step**, which bakes the same file into the model
@@ -83,7 +82,7 @@ never depends on the volume at runtime. This is the layout MLflow's own
 is the worked example:
 
 ```python
-WHEEL = Path("/Volumes/<catalog>/agent_platform/libs/agent_governance-0.1.0-py3-none-any.whl")
+WHEEL = Path("/Volumes/<catalog>/agent_platform/libs/agent_governance-0.2.0-py3-none-any.whl")
 
 logged = mlflow.pyfunc.log_model(
     name="coding_agent",
@@ -137,3 +136,17 @@ pytest libs/agent_governance/tests
 ```
 
 Offline: no workspace, no network, no database.
+
+## Migrating from 0.1.0
+
+0.2.0 merged four modules into the ones they were inseparable from. No function
+changed behaviour; two were renamed because their new module already had a
+`check`. A wheel pinned at 0.1.0 on the platform volume is unaffected —
+`publish_library` never overwrites a published version.
+
+| 0.1.0 | 0.2.0 |
+|---|---|
+| `agent_governance.prompting.untrusted_turn`, `.system_blocks` | `agent_governance.sanitize.untrusted_turn`, `.system_blocks` |
+| `agent_governance.deadline.Deadline`, `.deadline_for`, `.BudgetExhausted` | `agent_governance.resilience.Deadline`, `.deadline_for`, `.BudgetExhausted` |
+| `agent_governance.sql.safe_identifier`, `.table_exists_here`, `.UnsafeIdentifier` | `agent_governance.lakebase.safe_identifier`, `.table_exists_here`, `.UnsafeIdentifier` |
+| `agent_governance.privileges.check`, `.report`, `.PrivilegeFinding` | `agent_governance.rbac.check_privileges`, `.report_privileges`, `.PrivilegeFinding` |

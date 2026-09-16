@@ -14,36 +14,31 @@ from agent_governance.rbac import RbacPolicy
 from agent_governance.review_queue import Review, ReviewQueueError
 from langgraph.types import Command
 
-from supervisor.context import SupervisorContext
-from supervisor.dispatch import WorkerResponse
-from supervisor.guardrails import GuardrailResult, ScreenResult
+from supervisor.guardrail_engine import GuardrailResult, ScreenResult
 from supervisor.registry import AgentRegistry, WorkerAgent
 from supervisor.routing import RouteResult
+from supervisor.state import SupervisorContext
+from supervisor.worker_client import WorkerResponse
 
 
 class StubGuardrails:
-    """A fixed verdict, plus control over which agent the screen picks.
-
-    `owner` names the agent id the query should be routed to; None means the one
-    already addressed, which is what the single-agent path does.
-    """
+    """A fixed verdict, plus control over which agent the screen picks: `owner` names the
+    agent id to route to, None the one already addressed (the single-agent path)."""
 
     def __init__(self, result=None, owner=None):
         self.result = result or GuardrailResult(True, "semantic", "in domain")
         self.owner = owner
         self.calls = []
         self.screened = []
-        # Every flattened history the screen was given. Recorded so a test can
-        # assert what does *not* reach a governance prompt — session notes in
-        # particular, which reach a worker and no governance model.
+        # Every flattened history the screen was given, so a test can assert what does
+        # *not* reach a governance prompt — session notes in particular.
         self.histories = []
         # What the node passed as the turn's time budget, so a test can assert
         # the deadline reaches the fan-out rather than trusting that it does.
         self.deadlines = []
 
-    # The reason this stub's `deterministic_block` gives, when a test wants the
-    # held-over-request pre-screen to refuse. Empty means nothing is refused,
-    # which is what every test that does not care about it gets.
+    # The reason this stub's `deterministic_block` gives when a test wants the
+    # held-over-request pre-screen to refuse. Empty means nothing is refused.
     block_reason = ""
 
     def deterministic_block(self, query):
@@ -98,12 +93,8 @@ class StubWorkers:
 
 
 class StubAudit:
-    """Records every audit row, and can be made to fail.
-
-    `fail_on` is a set of outcomes whose write raises, so a test can drive the
-    §05 Stage 06 rule that a *governance decision* is not reported as applied
-    unless its record landed — while an ordinary answer still gets through.
-    """
+    """Records every audit row, and can be made to fail: `fail_on` is a set of outcomes
+    whose write raises, driving the §05 Stage 06 rule that a decision needs its record."""
 
     def __init__(self, fail_on=()):
         self.records = []
@@ -118,13 +109,8 @@ class StubAudit:
 
 
 class StubReviews:
-    """In-memory stand-in for the appeal / escalation queue.
-
-    Deliberately closer to the real thing than a bare mock: `claim_allowance`
-    consumes at most once, and `resolve` refuses an already-resolved review, so
-    the tests exercise the same one-winner semantics the Postgres implementation
-    gets from its conditional UPDATE.
-    """
+    """In-memory stand-in for the appeal / escalation queue, closer to the real thing than
+    a mock: the same one-winner semantics Postgres gets from its conditional UPDATE."""
 
     def __init__(self, fail=False):
         self.fail = fail
@@ -188,33 +174,20 @@ class StubReviews:
     def list_open(self, *, kind="", limit=100):
         self._guard()
         return [
-            r
-            for r in self.rows.values()
-            if r.status == "open" and (not kind or r.kind == kind)
+            r for r in self.rows.values() if r.status == "open" and (not kind or r.kind == kind)
         ][:limit]
 
 
 # ── Credential-shaped fixtures ──────────────────────────────────────────────
 #
-# Assembled at run time, never written out as one literal.
-#
-# A redaction test cannot demonstrate anything without a string of exactly the
-# shape it has to catch — and a complete one, written out, is indistinguishable
-# from a real leaked credential to every scanner that matters: GitHub's push
-# protection, which rejects the push outright; this repository's own secret
-# scan; and whatever the reader runs. The values are obviously synthetic
-# counting patterns, and splitting them at the prefix is what stops a scanner
-# matching a contiguous run, while the assembled value still exercises the
-# detector exactly as a real credential would.
-#
-# Put new credential shapes here rather than inline, so the next one does not
-# block a push to find out.
+# Assembled at run time, never written out as one literal: a complete credential-shaped
+# string is indistinguishable from a real leak to GitHub push protection and this repo's
+# own secret scan, while the split value still exercises the detector. New shapes go here.
 FAKE_DATABRICKS_TOKEN = "dapi" + "0123456789abcdef" * 2
 FAKE_GITHUB_TOKEN = "ghp_" + "1234567890abcdef" * 2 + "1234"
 FAKE_GOOGLE_API_KEY = "AIza" + "SyA1234567890abcdefghijklmnopqrstuv"
-# AWS's own documentation example pair — synthetic by publication, and split
-# here for the same reason as the rest rather than relying on every scanner
-# knowing that.
+# AWS's own documentation example pair — synthetic by publication, but split here for
+# the same reason as the rest rather than trusting every scanner to know that.
 FAKE_AWS_KEY_ID = "AKIA" + "IOSFODNN7EXAMPLE"
 FAKE_AWS_SECRET = "wJalrXUtnFEMI/" + "K7MDENG/bPxRfiCYEXAMPLEKEY"
 
@@ -249,14 +222,9 @@ def context_for(
     user_key="user-1",
     started_at=None,
 ):
-    """Runtime context for one turn — identity, never state (§4.4).
-
-    `started_at` anchors the turn's time budget. Left as the current monotonic
-    reading so the ordinary test path has a *live* budget rather than a disabled
-    one — a suite that ran with the deadline switched off would not be testing
-    the deployed configuration. Tests that want an exhausted budget pass a value
-    in the past; tests that want it disabled pass 0.
-    """
+    """Runtime context for one turn — identity, never state (§4.4). `started_at` stays a
+    live monotonic reading so tests run the deployed budget; a past value exhausts it,
+    0 disables it."""
     return SupervisorContext(
         user_role=role,
         user_key=user_key,
@@ -278,11 +246,8 @@ def invoke(
     user_key="user-1",
     started_at=None,
 ):
-    """One turn through the graph.
-
-    `agent` is the target fixed by the invocation path — each chat widget is
-    scoped to one agent, so it always names a concrete worker.
-    """
+    """One turn through the graph. `agent` is fixed by the invocation path — each chat
+    widget is scoped to one agent, so it always names a concrete worker."""
     return graph.invoke(
         {"messages": [{"role": "user", "content": text}], "conversation_id": thread},
         config={"configurable": {"thread_id": thread}},

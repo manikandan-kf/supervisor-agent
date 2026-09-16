@@ -4,8 +4,6 @@ RBAC gate -> Guardrails -> Route/Clarify -> Dispatch -> Respond & Audit,
 exposed as a Databricks ResponsesAgent on Model Serving.
 """
 
-# The source version. `pyproject.toml` reads it from here (`dynamic = ["version"]`)
-# so the two cannot drift. This is not the deployed version — a deployment is
-# identified by its Unity Catalog registered-model version, assigned at deploy
-# time — but it is what a checkout can answer, and what CHANGELOG.md tracks.
-__version__ = "1.1.0"
+# Source version; `pyproject.toml` reads it (`dynamic = ["version"]`) so they cannot
+# drift. Not the deployed version — that is the UC registered-model version.
+__version__ = "1.2.0"

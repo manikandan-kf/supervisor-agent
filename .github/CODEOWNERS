@@ -11,13 +11,16 @@
 # The governance surface. A change to any of these changes what every agent on
 # the platform is allowed to do, or what it can be shown to have done, so it
 # deserves a named reviewer rather than the default one.
-/libs/agent_governance/         @<org>/<security-team>
-/src/supervisor/guardrails.py   @<org>/<security-team>
-/src/supervisor/config.py       @<org>/<security-team>
-/src/supervisor/config/         @<org>/<security-team>
-/SECURITY.md                    @<org>/<security-team>
+/libs/agent_governance/             @<org>/<security-team>
+/src/supervisor/guardrail_engine.py @<org>/<security-team>
+/src/supervisor/nodes/rbac_gate.py  @<org>/<security-team>
+/src/supervisor/nodes/guardrails.py @<org>/<security-team>
+/src/supervisor/config.py           @<org>/<security-team>
+/src/supervisor/config/             @<org>/<security-team>
+/SECURITY.md                        @<org>/<security-team>
 
 # The deployment path.
-/databricks.yml                 @<org>/<platform-team>
-/deploy/                        @<org>/<platform-team>
-/.github/workflows/             @<org>/<platform-team>
+/databricks.yml                     @<org>/<platform-team>
+/resources/                         @<org>/<platform-team>
+/deploy/                            @<org>/<platform-team>
+/.github/workflows/                 @<org>/<platform-team>

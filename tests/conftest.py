@@ -8,11 +8,8 @@ _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / "src"))
 sys.path.insert(0, str(_REPO / "libs" / "agent_governance" / "src"))
 
-# The suite runs offline. Without this every `get_prompt` attempts a Unity
-# Catalog round-trip, fails, logs a WARNING and returns the bundled default —
-# so the assertions held against the fallback anyway, just slower and noisier.
-# Setting it makes that explicit: tests pin the bundled templates, which is the
-# text the deployed endpoint is actually running today.
+# The suite runs offline. Without this every `get_prompt` attempts a Unity Catalog
+# round-trip and falls back anyway, so tests pin the bundled templates either way.
 os.environ.setdefault("PROMPT_REGISTRY_ENABLED", "false")
 
 import pytest  # noqa: E402

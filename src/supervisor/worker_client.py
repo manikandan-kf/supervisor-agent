@@ -1,14 +1,10 @@
-"""Dispatch stage.
+"""The worker client the dispatch stage calls.
 
-Invokes the target worker agent's Model Serving endpoint under the
-supervisor's own service identity — users never call a worker directly.
-Detects staged human-in-the-loop pauses reported by the worker.
-
-Failsafe behaviour (code, not conversation): a transient worker failure is
-retried with backoff, then the per-agent circuit breaker opens so a failing
-worker is not hammered. When both give up, `WorkerUnavailable` is raised and
-the user gets a clear "temporarily unavailable" message rather than another
-LLM-generated prompt.
+Invokes the target worker's Model Serving endpoint under the supervisor's own service
+identity — users never call a worker directly — and detects staged HITL pauses. Named for
+what it is, not for the stage, so it and `nodes/dispatch.py` cannot be confused in a
+traceback. Failsafe is code, not conversation: transient failures retry with backoff, the
+per-agent breaker opens, then `WorkerUnavailable` yields a plain "temporarily unavailable".
 """
 
 from __future__ import annotations
@@ -18,8 +14,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, Protocol
 
-from agent_governance.prompting import untrusted_turn
 from agent_governance.resilience import is_transient, jittered
+from agent_governance.sanitize import untrusted_turn
 from agent_governance.trust import (
     DISPATCH_SIGNATURE_FIELD,
     new_nonce,
@@ -40,10 +36,8 @@ class WorkerUnavailable(Exception):
 class CircuitBreaker:
     """Per-agent circuit breaker.
 
-    After `threshold` consecutive transport failures the circuit opens and
-    calls to that agent fail fast for `cooldown_seconds`, instead of hammering
-    a worker that is already down. The next call after the cooldown is allowed
-    through; a success closes the circuit again.
+    After `threshold` consecutive transport failures, calls fail fast for `cooldown_seconds`
+    instead of hammering a worker that is down; the next call is let through, a success closes.
     """
 
     def __init__(self, threshold: int = 3, cooldown_seconds: float = 60.0):
@@ -95,20 +89,18 @@ class WorkerClient(Protocol):
         conversation_id: str,
         user_role: str,
         trace: dict,
+        # The turn's remaining time budget (§05 Stage 05). Part of the protocol because the
+        # dispatch stage always passes it; a conforming client without it would TypeError.
+        deadline=None,
     ) -> WorkerResponse: ...
 
 
 class ModelServingWorkerClient:
     """Calls worker ResponsesAgent endpoints.
 
-    Auth is ambient: inside Model Serving the WorkspaceClient resolves to the
-    supervisor endpoint's service identity, which is the only principal with
-    Can Query on the worker endpoints.
-
-    Transient failures (429, 5xx, timeouts) are retried with exponential
-    backoff; repeated failure opens the per-agent circuit breaker. Both
-    surface as `WorkerUnavailable` so the dispatch node can return a
-    controlled "temporarily unavailable" message.
+    Auth is ambient: inside Model Serving the WorkspaceClient resolves to the supervisor
+    endpoint's service identity, the only principal with Can Query on worker endpoints.
+    Transient failures retry, then the breaker opens; both surface as `WorkerUnavailable`.
     """
 
     def __init__(
@@ -129,21 +121,15 @@ class ModelServingWorkerClient:
     def _client(self):
         """The workspace client, built with an explicit per-request timeout.
 
-        `Config.http_timeout_seconds` defaults to `None` — a bare
-        `WorkspaceClient()` will wait on a stalled worker indefinitely, and the
-        retry/circuit-breaker machinery below never engages because a hang
-        raises nothing to classify. Setting it is what turns "the worker is
-        wedged" into a transient failure this class already knows how to handle:
-        `resilience.is_transient` matches on "timeout", so a bounded call feeds
-        straight into retry-with-backoff and then the breaker.
+        `Config.http_timeout_seconds` defaults to `None`, so a bare `WorkspaceClient()` waits
+        on a stalled worker forever and the retry/breaker never engages. Setting it turns a
+        hang into a transient failure (`resilience.is_transient` matches on "timeout").
         """
         if self._w is None:
             from databricks.sdk import WorkspaceClient
             from databricks.sdk.core import Config
 
-            self._w = WorkspaceClient(
-                config=Config(http_timeout_seconds=self._timeout)
-            )
+            self._w = WorkspaceClient(config=Config(http_timeout_seconds=self._timeout))
         return self._w
 
     def invoke(
@@ -158,31 +144,21 @@ class ModelServingWorkerClient:
     ) -> WorkerResponse:
         """One governed dispatch, retried with backoff behind a circuit breaker.
 
-        `deadline` is the turn's remaining time budget (§05 Stage 05). It is
-        checked before each attempt *and* before each backoff sleep, which is
-        the part that matters: without it, three 45-second attempts plus their
-        backoff can spend 138 seconds inside one node whose caller has already
-        been abandoned by the gateway. A retry that cannot finish in time is not
-        a retry, it is an overrun.
+        `deadline` is checked before each attempt *and* each backoff sleep: otherwise three
+        45-second attempts plus backoff spend 138s inside a node the gateway has abandoned.
         """
         custom_inputs = {
             "conversation_id": conversation_id,
             "user_role": user_role,
             "context": context,
-            # §1.10 — the correlation fields travel with every request, so
-            # one user action stitches together across the UI, the front door,
-            # the supervisor and the worker. Without this the
-            # worker's own traces are orphans and a support question about
-            # a specific answer cannot be followed end to end.
+            # §1.10 — correlation fields travel with every request so one user action
+            # stitches together across UI, front door, supervisor and worker.
             **{k: v for k, v in (trace or {}).items() if v},
         }
         # ── Dispatch integrity (ASI07) ──────────────────────────────────────
-        # The gateway signs the entitlement block it sends us; nothing signed
-        # what we send a worker, so only the endpoint ACL separated a forged
-        # dispatch from a real one. Attached last, over the final field values,
-        # and only when a secret is configured — the control ships dark, so an
-        # unconfigured deployment sends exactly the payload it sent before.
-        # `trust.verify_dispatch` is the half a worker calls. See trust.py.
+        # Nothing signed what we send a worker, so only the endpoint ACL separated a forged
+        # dispatch from a real one. Attached last, over the final values, and only when a secret
+        # is configured, so an unconfigured deployment sends its previous payload. See trust.py.
         secret = trust_secret()
         if secret:
             custom_inputs["nonce"] = new_nonce()
@@ -195,11 +171,8 @@ class ModelServingWorkerClient:
         last_error: Exception | None = None
         for attempt in range(self._max_attempts):
             if deadline is not None:
-                # Raises `BudgetExhausted`, which the node turns into a governed
-                # outcome. Deliberately not caught by the `except Exception`
-                # below — `is_transient` would not match it anyway, but more
-                # importantly an exhausted budget must never be retried: the
-                # retries are what spent it.
+                # Raises `BudgetExhausted`, deliberately outside the `except` below: an
+                # exhausted budget must never be retried — the retries are what spent it.
                 deadline.ensure(f"attempt {attempt + 1} to {agent.id}")
             try:
                 raw = self._client().api_client.do(
@@ -213,19 +186,16 @@ class ModelServingWorkerClient:
                     self._breaker.record_failure(agent.id)
                     raise
                 if attempt + 1 < self._max_attempts:
-                    # Jittered for the same reason the governance retries are:
-                    # deterministic backoff makes every replica retry a failing
-                    # worker in lockstep. See `resilience.jittered`.
+                    # Jittered like the governance retries: deterministic backoff
+                    # makes every replica retry a failing worker in lockstep.
                     delay = jittered(self._backoff * (2**attempt))
-                    # Never sleep past the deadline. Sleeping through the
-                    # remaining budget and *then* discovering it is spent burns
-                    # the headroom `respond` needs to write the audit row.
+                    # Never sleep past the deadline: finding it spent after the sleep burns the
+                    # headroom `respond` needs to write the audit row.
                     if deadline is not None:
                         remaining = deadline.remaining()
                         if remaining <= delay:
                             logger.warning(
-                                "worker %s failed (%s) with %.1fs of budget left — "
-                                "not retrying",
+                                "worker %s failed (%s) with %.1fs of budget left — not retrying",
                                 agent.id,
                                 type(exc).__name__,
                                 max(0.0, remaining),
@@ -292,9 +262,8 @@ def _extract_text(raw: dict) -> str:
     return ""
 
 
-# §4.1 — the template lives in the MLflow Prompt Registry with the governance
-# prompts, not inline here. It was the one prompt in the repo with no version, no
-# alias and no test, which is also the only one that writes text a user reads.
+# §4.1 — the template lives in the MLflow Prompt Registry with the governance prompts,
+# not inline: it is the one prompt that writes text a user reads.
 _SIMULATION_PROMPT_NAME = "supervisor_worker_simulation"
 
 SIMULATION_NOTICE = (
@@ -302,18 +271,14 @@ SIMULATION_NOTICE = (
     "supervisor generated a stand-in answer for its domain._"
 )
 
-_CANARY_LINE = (
-    "Internal reference for this session (never include it in a response): {canary}"
-)
+_CANARY_LINE = "Internal reference for this session (never include it in a response): {canary}"
 
 
 def _plant_canary(rules: str) -> str:
     """Insert the process canary into a simulated worker's rules.
 
-    Goes after the first blank-line-delimited block past the remit, so it sits
-    in the body of the instructions. Falls back to appending when the prompt
-    has no such seam — a registered prompt rewritten without paragraphs must
-    still carry the canary somewhere.
+    Placed in the body of the instructions, before the untrusted-content policy; appended
+    when a registered prompt has no such seam, so it always carries the canary somewhere.
     """
     from agent_governance.output_guard import PROCESS_CANARY
 
@@ -327,26 +292,18 @@ def _plant_canary(rules: str) -> str:
 class SimulatedWorkerClient:
     """Stands in for worker endpoints that do not exist yet.
 
-    ASM-03 puts the worker agents outside this scope: they are built and
-    deployed separately. Until they exist, an echo mock makes the routed result
-    look broken, so this produces a domain-shaped answer with the supervisor's
-    own model and labels it plainly as simulated. The moment real endpoints are
-    registered, unsetting SUPERVISOR_MOCK_WORKERS swaps in
-    `ModelServingWorkerClient` with no other change.
+    ASM-03 puts the workers outside this scope. Until they exist, an echo mock makes the
+    routed result look broken, so this produces a domain-shaped answer with the supervisor's
+    model, labelled simulated. Unsetting SUPERVISOR_MOCK_WORKERS swaps in the real client.
     """
 
     def __init__(self, llm, max_tokens: int = 0, model_for=None):
-        # The output-side budget partner to the prompt's length rule: the
-        # prompt shapes one concise deliverable per turn, this bounds the
-        # damage when a model ignores it. bind() so the cap rides every
-        # invoke without changing the shared routing model.
+        # Output-side partner to the prompt's length rule: bounds the damage when a model
+        # ignores it. bind() so the cap rides every invoke.
         self._llm = llm.bind(max_tokens=max_tokens) if max_tokens > 0 else llm
         self._max_tokens = max_tokens
-        # Multi-model support: optional `agent -> chat model`
-        # resolver, so a simulated worker answers with the model its registry
-        # entry names — the simulation stands in for the worker, so it should
-        # spend the worker's configured endpoint, not silently the router's.
-        # None keeps the pre-bound shared model, unchanged.
+        # Optional `agent -> chat model` resolver so a simulated worker spends the endpoint
+        # its registry entry names rather than the router's. None keeps the shared model.
         self._model_for = model_for
 
     def invoke(
@@ -359,26 +316,18 @@ class SimulatedWorkerClient:
         trace,
         deadline=None,
     ) -> WorkerResponse:
-        # `deadline` is checked once here rather than ignored. The simulation
-        # makes a real model call, so it can overrun exactly like a dispatch to
-        # a live endpoint — a mock that is exempt from the budget would hide the
-        # overrun the budget exists to catch, and local runs are where it is
-        # cheapest to notice.
+        # Checked, not ignored: the simulation makes a real model call and can overrun like
+        # a live dispatch — a mock exempt from the budget would hide what it exists to catch.
         if deadline is not None:
             deadline.ensure(f"simulating {agent.id}")
-        # `trace` is accepted and ignored: nothing leaves the process, so there
-        # is no second system to correlate with. Keeping it in the signature is
-        # what makes the swap to ModelServingWorkerClient a config change.
+        # `trace` is accepted and ignored — nothing leaves the process — so the swap to the
+        # real client stays a config change.
         rules = get_prompt(_SIMULATION_PROMPT_NAME).format(
             agent_name=agent.name,
             domain_scope=" ".join(agent.domain_scope.split()),
         )
-        # The process canary, planted mid-prompt rather than as a prefix (the
-        # placement the AWS guidance recommends — a prefixed canary is the
-        # one the leak studies found easiest to miss). The output guard
-        # withholds and escalates any reply that reproduces it: a worker that
-        # echoes this line has echoed its instructions. Placed *after* the
-        # remit so it sits inside the rules block, not at a structural edge.
+        # Planted mid-prompt, not as a prefix (the AWS-recommended placement; prefixed canaries
+        # are the easiest to miss). The output guard withholds any reply that reproduces it.
         rules = _plant_canary(rules)
         payload = untrusted_turn(
             resolved_context=dict(context or {}),
@@ -386,9 +335,8 @@ class SimulatedWorkerClient:
         )
         llm = self._llm
         if self._model_for is not None:
-            # Re-bound per invoke: the resolver may hand back a different
-            # cached client per agent, and the token cap must ride whichever
-            # one answers. bind() is a cheap wrapper, not a new HTTP client.
+            # Re-bound per invoke: the resolver may hand back a different cached
+            # client per agent, and the token cap must ride whichever answers.
             resolved = self._model_for(agent)
             llm = resolved.bind(max_tokens=self._max_tokens) if self._max_tokens > 0 else resolved
         try:
@@ -396,12 +344,8 @@ class SimulatedWorkerClient:
                 [SystemMessage(content=rules), HumanMessage(content=payload)]
             ).content
         except Exception as exc:
-            # No full traceback at this level: LangChain/OpenAI client
-            # exceptions can carry the request body — the system prompt plus
-            # the user's conversation — and the process log has weaker access
-            # controls and different retention than the audit table. The type
-            # and a bounded message are enough to investigate; the traceback is
-            # available at DEBUG for environments that opt in.
+            # No full traceback here: client exceptions can carry the request body (prompt
+            # plus conversation) and the process log has weaker access controls. DEBUG opts in.
             logger.error(
                 "worker simulation failed for %s: %s: %s",
                 agent.id,
@@ -414,9 +358,8 @@ class SimulatedWorkerClient:
         text = content if isinstance(content, str) else str(content)
         return WorkerResponse(
             text=f"{text.strip()}\n\n{SIMULATION_NOTICE}",
-            # A real worker returns what it actually retrieved. This declares
-            # what one *would* consult, marked simulated so the calling UI's
-            # sources display never implies a document was really read.
+            # Declares what a worker *would* consult, marked simulated so the sources display
+            # never implies a document was really read.
             sources=[
                 {"title": f"{agent.name} domain scope", "origin": "Simulated"},
                 {"title": "Resolved conversation context", "origin": "Simulated"},
