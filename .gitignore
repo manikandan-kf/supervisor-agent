@@ -36,3 +36,9 @@ build/
 coverage.xml
 htmlcov/
 .mypy_cache/
+
+# Personal reference copies: a workspace-specific deploy walkthrough
+# (DEPLOYMENT.md is the tracked one) and the design documents the code is
+# written against. Both stay local.
+DEPLOY-RUNBOOK.md
+updated-technical-solution/

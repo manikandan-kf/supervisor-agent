@@ -20,7 +20,7 @@
 #        lakebase_instance: supervisor-memory-${bundle.target}
 #    Budget for it: an instance bills continuously, so this is two bills.
 # 2. Uncomment the block below.
-# 3. Create it once with `databricks bundle deploy`, and drop §3 of the runbook.
+# 3. Create it once with `databricks bundle deploy`, and drop DEPLOYMENT.md §3.
 #
 # `prevent_destroy` is what makes this survivable: `bundle destroy` refuses
 # rather than deleting every conversation, audit row and governed document in
@@ -41,7 +41,7 @@
 # creation path (publish_library.py creates it imperatively today, which is why
 # the volume does not need to exist first).
 #
-# `grants` is the declarative form of runbook §7d: each consuming agent's deploy
+# `grants` is the declarative form of DEPLOYMENT.md §7d: each consuming agent's deploy
 # identity needs READ_VOLUME and nothing more. Whoever can write this volume can
 # replace the output guard, the RBAC check and the audit sink for every agent at
 # once, so write stays with the one deploy identity.

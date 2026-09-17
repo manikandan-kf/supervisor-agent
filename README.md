@@ -1,7 +1,7 @@
 # Custom LangGraph Supervisor Agent
 
 The Supervisor Agent from *Supervisor Agent — Solution Design & Architecture*
-(v1.2, `updated-technical-solution/`): a custom LangGraph graph, served on
+(v1.2): a custom LangGraph graph, served on
 Databricks Model Serving as an MLflow `ResponsesAgent`, that takes every user
 turn through a fixed pipeline before any worker agent is reached:
 
@@ -15,8 +15,7 @@ that authenticates users and resolves their roles) is a separate deliverable and
 is not in this repository. Where the supervisor depends on it, this README says
 "the caller" and states exactly what the caller must send.
 
-**To deploy it, follow [DEPLOYMENT.md](DEPLOYMENT.md).** The workspace-specific
-fill-in companion is [DEPLOY-RUNBOOK.md](DEPLOY-RUNBOOK.md).
+**To deploy it, follow [DEPLOYMENT.md](DEPLOYMENT.md).**
 
 ---
 
@@ -98,7 +97,6 @@ not stated below.
 |---|---|
 | `README.md` | This file |
 | `DEPLOYMENT.md` | Everything the supervisor needs from a workspace, everything it creates, the step order, the grants and the verification |
-| `DEPLOY-RUNBOOK.md` | The same steps with one workspace's real values filled in. Not tracked as a template; edit it for your workspace |
 | `CHANGELOG.md` | What changed between source versions |
 | `CONTRIBUTING.md`, `SECURITY.md`, `LICENSE` | How to contribute, how to report a vulnerability, licence |
 | `databricks.yml` | The Databricks Asset Bundle: variables, the library wheel artifact, the sync set, the `dev` and `prod` targets (solution §08 "CI/CD with DABs") |
@@ -111,7 +109,6 @@ not stated below.
 | `.github/workflows/ci.yml` | Lint, security ruleset, tests, wheel build, dependency audit and secret scan on every push |
 | `.github/CODEOWNERS`, `.github/dependabot.yml` | Review ownership of the governance surface; dependency update PRs |
 | `.gitattributes`, `.gitignore` | Line endings; build output and local state kept out of git |
-| `updated-technical-solution/` | The design documents this code is written against |
 
 ### `src/supervisor/` — the agent
 

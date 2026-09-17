@@ -86,17 +86,6 @@ solution does not ask for is gone. Shared library 0.2.0 → 0.3.0.
   `SESSION_NOTES_MAX` and `SESSION_NOTE_MAX_CHARS`. Setting one now has no
   effect; none is required.
 
-### Added
-
-- **`DEPLOY-RUNBOOK.md`** — the deploy walked through end to end: prerequisites,
-  the bundle targets, the four job tasks, the Lakebase grants that need an
-  admin, and what to check in the AI Playground once the endpoint is `READY`,
-  including the two failures this workspace actually hits (`agents.deploy()`
-  and the Lakebase resource permission).
-- **`updated-technical-solution/`** — the v1.2 solution document the code is
-  traced against, kept in the repository so every `§` reference in a comment
-  resolves to something a reader can open.
-
 ### Changed
 
 - Renamed so the file name says what the file is for. Supervisor: `agent.py` →
@@ -224,8 +213,8 @@ publish.
 - **`--lakebase-resource skip`** deploys with `LAKEBASE_INSTANCE` stamped on the
   endpoint but the instance *not* declared as a model resource, so the
   admin-only passthrough check never runs. The obvious alternative — passing an
-  empty `--lakebase-instance` — is wrong and is called out as such in the
-  runbook: it leaves the container with no Lakebase target, and a deployed
+  empty `--lakebase-instance` — is wrong and is called out as such in
+  DEPLOYMENT.md: it leaves the container with no Lakebase target, and a deployed
   environment then refuses to boot rather than degrading to in-memory state.
 - **`DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET` can
   now be passed through to the endpoint** by `log_and_deploy.py`, as the
@@ -234,7 +223,7 @@ publish.
   admin, and without this the endpoint has no other way to reach durable state.
   Pass `{{secrets/<scope>/<key>}}` references, not literals: the value is
   stamped onto the endpoint configuration, which anyone with CAN_VIEW can read.
-  Recorded as a downgrade, in the code and in the runbook: the container then
+  Recorded as a downgrade, in the code and in DEPLOYMENT.md: the container then
   acts as one static principal for every call rather than holding a separate
   short-lived credential per declared resource, and the secret is rotated by
   hand. Nothing changes for a deployment that can use the passthrough — unset

@@ -88,7 +88,7 @@ def _sanitize(uc_name: str) -> str:
 def endpoint_name(uc_model: str) -> str:
     """`agents_<catalog>-<schema>-<model>`, derived exactly as databricks.agents does.
 
-    Docs, grants and runbooks address the endpoint by this name, so both deploy methods must
+    Docs and grants address the endpoint by this name, so both deploy methods must
     agree. Checked against `_create_endpoint_name` in databricks-agents 1.11.0.
     """
     prefix = "agents_"
