@@ -9,7 +9,7 @@
 -e libs/agent_governance
 
 # Lint + security ruleset (see [tool.ruff] in pyproject.toml).
-ruff==0.14.6
+ruff==0.16.7
 
 # Both test trees. Everything runs offline — no workspace, no network, no
 # database — so `pytest` needs nothing configured first.
