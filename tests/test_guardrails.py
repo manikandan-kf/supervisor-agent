@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from agent_governance.policy_eval import Case, evaluate, parse_cases
+from agent_governance.policy_suite_eval import Case, evaluate, parse_cases
 from helpers import REGISTRY
 
 from supervisor.guardrail_engine import GuardrailEngine, GuardrailVerdict
@@ -529,7 +529,7 @@ def test_screen_answers_small_talk_without_choosing_an_agent():
 
 
 def _agent_with_denies(agent_id, name, *denies):
-    from supervisor.registry import WorkerAgent
+    from supervisor.agent_registry import WorkerAgent
 
     return WorkerAgent(
         id=agent_id,
@@ -601,7 +601,7 @@ def test_agent_deny_pattern_blocks():
 
 # ═══ The policy regression corpus ════════════════════════════════════════════════
 #
-# Pins both that `policy_eval` behaves (right verdict, malformed suite rejected,
+# Pins both that `policy_suite_eval` behaves (right verdict, malformed suite rejected,
 # over-blocking is a failure) and that the bundled guardrails document passes every case
 # — the same corpus and evaluator `publish_config.py --apply` runs at publish time.
 

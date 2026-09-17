@@ -9,40 +9,30 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from agent_governance.resilience import BudgetExhausted, deadline_for
-from agent_governance.spend import (
-    PROMPT_OVERHEAD_CHARS,
-    VERDICT_OUTPUT_TOKENS,
-    SpendCaps,
-    SpendExhausted,
-    TurnSpend,
-    estimate_tokens,
-)
+from agent_governance.retry_and_deadline import BudgetExhausted, deadline_for
 from langgraph.runtime import Runtime
 from langgraph.types import Command
 
-from ..messages import (
-    GOVERNANCE_UNAVAILABLE_MESSAGE,
-    progress,
-)
 from ..state import SupervisorContext
-from .limits import LimitsMixin
-from .turn import (
+from ..user_facing_text import (
+    GOVERNANCE_UNAVAILABLE_MESSAGE,
+)
+from .base import (
     _entry,
     _history_lines,
     _trail,
     _window,
 )
+from .failsafes import FailsafesMixin
 
 logger = logging.getLogger(__name__)
 
 
-class RouteMixin(LimitsMixin):
+class RouteMixin(FailsafesMixin):
     def route(
         self, state: dict, runtime: Runtime[SupervisorContext]
     ) -> Command[Literal["dispatch", "respond"]]:
         context = runtime.context or SupervisorContext()
-        progress("route", "started")
         deadline = deadline_for(context, self.s.settings)
         agent = self.s.registry.get(state["target_agent_id"])
 
@@ -52,7 +42,7 @@ class RouteMixin(LimitsMixin):
         user_key = context.user_key
         agent_keys = set(agent.required_context)
 
-        # ── Session isolation (§4.4) ────────────────────────────────────────
+        # ── Session isolation ───────────────────────────────────────────────
         # The conversation's own `session_context` wins and the long-term store is only a seed:
         # otherwise a second conversation about beta would silently turn the first, still about
         # alpha, into beta artifacts. Both are narrowed to the keys the target agent declared.
@@ -71,23 +61,12 @@ class RouteMixin(LimitsMixin):
         prior = {**remembered, **session_context}
         seeded = {k: v for k, v in remembered.items() if k not in session_context}
 
-        # Same fail-closed rule as the screen (§06): a routing model that cannot be reached
+        # Same fail-closed rule as the screen (solution §05): a routing model that cannot be reached
         # holds the request rather than dispatching it with unresolved context.
-        spend = TurnSpend.from_state(state, SpendCaps.from_settings(self.s.settings))
         window = _window(state.get("messages"), self.s.settings.history_max_tokens)
-        # An agent with no `required_context` resolves without a model call, and a free path
-        # must not be refused by a spend ceiling or charged. Mirrors the router's own condition.
-        resolves_by_model = bool(agent.required_context)
-        route_tokens = (
-            estimate_tokens(window, extra_chars=PROMPT_OVERHEAD_CHARS) + VERDICT_OUTPUT_TOKENS
-            if resolves_by_model
-            else 0
-        )
 
         try:
             deadline.ensure("context resolution")
-            if resolves_by_model:
-                spend.ensure("context resolution", model_calls=1, tokens=route_tokens)
             result = self.s.router.resolve(
                 agent,
                 _history_lines(window),
@@ -99,8 +78,6 @@ class RouteMixin(LimitsMixin):
             )
         except BudgetExhausted as exc:
             return self._budget_exhausted(state, "route", exc)
-        except SpendExhausted as exc:
-            return self._spend_exhausted(state, "route", exc, spend)
         except Exception as exc:
             # Scrubbed for the same reason as the guardrail path: the exception
             # can carry the prompt, and the prompt carries the user's data.
@@ -111,14 +88,9 @@ class RouteMixin(LimitsMixin):
                 str(exc)[:200],
             )
             logger.debug("context resolution traceback", exc_info=True)
-            progress("route", "error", "checks unavailable")
-            # Charged for the same reason as the screen's failure path above.
-            if resolves_by_model:
-                spend.charge("route", model_calls=1, tokens=route_tokens)
             return Command(
                 goto="respond",
                 update={
-                    "spend": spend.record(),
                     "outcome": "error",
                     "final_text": GOVERNANCE_UNAVAILABLE_MESSAGE,
                     "audit_trail": _trail(
@@ -129,10 +101,6 @@ class RouteMixin(LimitsMixin):
                     ),
                 },
             )
-
-        if resolves_by_model:
-            spend.charge("route", model_calls=1, tokens=route_tokens)
-        spent = {"spend": spend.record()}
 
         if result.ready:
             # §04: what long-term memory accepted and refused belongs in the trail — a refused
@@ -189,7 +157,6 @@ class RouteMixin(LimitsMixin):
                 if result.context_applies
                 else "request does not depend on the agent's required context"
             )
-            progress("route", "done", "" if result.context_applies else "not required here")
             # Pin what was dispatched on to this conversation so another conversation cannot
             # move it. Pinned on dispatch only, never on clarify: binding to a guess is what the
             # question exists to avoid. Dropped keys stay dropped — the router just decided so.
@@ -218,7 +185,6 @@ class RouteMixin(LimitsMixin):
             return Command(
                 goto="dispatch",
                 update={
-                    **spent,
                     "route": {
                         "next": "dispatch",
                         "resolved_context": result.resolved_context,
@@ -236,9 +202,5 @@ class RouteMixin(LimitsMixin):
             state,
             "route",
             result.clarifying_question,
-            {
-                **spent,
-                "route": {"next": "respond", "resolved_context": result.resolved_context},
-            },
-            context,
+            {"route": {"next": "respond", "resolved_context": result.resolved_context}},
         )

@@ -4,14 +4,14 @@
 # Precision over recall, deliberately: every pattern here should be something
 # no legitimate SDLC request contains. The semantic tier judges everything
 # these rules don't catch, and a false block costs the user their only route
-# in (the appeal path is the recovery, not an excuse). Pattern families follow
+# in — a block is final, there is no appeal path. Pattern families follow
 # OWASP LLM01:2025 (direct injection, obfuscated/encoded payloads, persona
 # jailbreaks, system-prompt exfiltration) and OWASP LLM02:2025
 # (sensitive-information requests: cross-tenant data, bulk disclosure, stored
 # secrets and infrastructure detail).
 #
 # Each rule is {pattern, reason, action?}. `action` is `block` (the default:
-# refuse with the reason and an appeal path) or `escalate` (refuse AND hand the
+# refuse with the reason; final) or `escalate` (refuse AND hand the
 # conversation to a human reviewer, holding it until they respond — for the
 # requests where a refusal alone under-reports what happened).
 global_deny_patterns:
@@ -67,9 +67,8 @@ global_deny_patterns:
   - pattern: "(?i)(decode|convert|translate)\\b.{0,40}(base64|rot13|hex)\\b.{0,40}(follow|execute|obey|run|comply|act\\s+on)"
     reason: the request smuggles instructions through an encoded payload
 
-  # ── Data-sensitivity exclusions (Governance Blueprint §06, OWASP LLM02) ────
-  # "Classify at the boundary... reject rather than protect what is out of
-  # scope." These agents produce SDLC artifacts from documented or synthetic
+  # ── Data-sensitivity exclusions (OWASP LLM02) ──────────────────────────────
+  # Reject at the boundary rather than protect what is out of scope. These agents produce SDLC artifacts from documented or synthetic
   # inputs; none of them is a channel to live data. Each rule below names a
   # *request for real data*, never a request to build something that handles
   # it — "write user stories for the payment card vault" is in scope, "show me
@@ -181,8 +180,8 @@ output_deny_patterns:
 # ── Output policy: what happens to each category of sensitive finding ──────
 # Consumed by output_guard.OutputPolicy. Actions: allow | mask | block |
 # escalate. `mask` replaces the value with `[redacted:<label>]`; `block`
-# withholds the response with a governed message and offers the appeal path;
-# `escalate` withholds it AND opens a human review, holding the conversation.
+# withholds the response with a governed message; `escalate` withholds it AND
+# opens a human review, holding the conversation.
 #
 # Defaults mirror the tiers Google DLP, AWS Bedrock Guardrails and Databricks
 # detect_sensitive_data agree on: the high tier (credentials, national

@@ -1,9 +1,10 @@
-"""Model client creation (§4.1).
+"""Model client creation.
 
 No model identifier is hardcoded in `graph.py`, nodes or tools; every client is a
 `ChatDatabricks` over a Model Serving endpoint, so changing the routing model is config
-(`ROUTING_LLM_ENDPOINT=...`) and another vendor is an external-model endpoint behind the AI
-Gateway (ASM-04). `databricks` is not an `init_chat_model` provider, hence no provider switch.
+(`ROUTING_LLM_ENDPOINT=...`) and another vendor is an external-model serving endpoint (solution
+§06: models come from the approved list). `databricks` is not an `init_chat_model` provider, hence
+no provider switch.
 Multi-model support ships dark: until `MULTI_MODEL_ENABLED=true` every agent resolves to the
 routing model regardless of what its registry entry declares.
 """
@@ -43,7 +44,7 @@ def get_routing_model(settings):
     Cached per (endpoint, temperature, timeout, max_retries). `timeout` and `max_retries` are
     passed explicitly because `ChatDatabricks` defaults of `None` fall through to the OpenAI
     client's 600s read timeout and 2 retries — a stalled model held a serving worker ten
-    minutes. Hence 30s and 0: one bound, one retry authority (`resilience.invoke_with_retries`).
+    minutes. Hence 30s and 0: one bound, one retry authority (`retry_and_deadline.invoke_with_retries`).
     """
     return _cached_chat_model(
         settings.routing_llm_endpoint,

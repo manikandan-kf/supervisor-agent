@@ -2,8 +2,8 @@
 
 Entry points: `build_checkpointer` / `build_store` (Lakebase via `LAKEBASE_INSTANCE`,
 `LAKEBASE_AUTOSCALING_ENDPOINT` or `LAKEBASE_PROJECT`+`LAKEBASE_BRANCH`; else in-memory, refused
-off a workstation by `refuse_non_durable`), `audit_connection_source`, `lock_connection_source`
-(pooled, credentials rotate ~15 min), `safe_identifier` and `table_exists_here`. No DSN mode — a
+off a workstation by `refuse_non_durable`), `audit_connection_source` (pooled, credentials
+rotate ~15 min), `safe_identifier` and `table_exists_here`. No DSN mode — a
 second connection mode is a second set of semantics. Every function takes the schema explicitly.
 """
 
@@ -24,10 +24,8 @@ logger = logging.getLogger(__name__)
 # code on load. `setdefault`, so an operator can still widen it deliberately.
 os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
 
-# Governance tables share one small pool; the thread lock gets its own, because a lock holds its
-# connection for the whole turn and would starve the audit write at the end of that turn.
+# The governance tables (audit sink, config store) share one small pool.
 _audit_pool = None
-_lock_pool = None
 
 
 def _pool_kwargs() -> dict:
@@ -188,7 +186,7 @@ def build_store(schema: Optional[str] = None):
 
 def audit_connection_source(schema: Optional[str] = None):
     """A zero-arg callable yielding a context-managed connection for the governance tables
-    (audit sink, config store, review queue), or None when no Lakebase is configured.
+    (audit sink, config store), or None when no Lakebase is configured.
 
     Borrows from a small dedicated pool, built on first use.
     """
@@ -203,25 +201,6 @@ def audit_connection_source(schema: Optional[str] = None):
             logger.exception("Lakebase audit pool failed for %s", _label(target))
             return None
     return _audit_pool.connection  # zero-arg context manager
-
-
-def lock_connection_source(schema: Optional[str] = None):
-    """A connection source for the per-thread execution lock, or None.
-
-    Its own pool, sized for concurrency: a lock is held for a whole turn, so N in-flight turns
-    need N connections. None sends `locking.thread_lock` to its per-process fallback.
-    """
-    target = lakebase_target(schema)
-    if not target:
-        return None
-    global _lock_pool
-    if _lock_pool is None:
-        try:
-            _lock_pool = _new_pool(min_size=1, max_size=6, **target)
-        except Exception:
-            logger.exception("Lakebase lock pool failed for %s", _label(target))
-            return None
-    return _lock_pool.connection
 
 
 # ---------------------------------------------------------------------------

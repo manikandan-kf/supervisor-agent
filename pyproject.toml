@@ -7,7 +7,7 @@
 # Two things this file deliberately does NOT own:
 #
 #   * **What the serving container installs.** That is `requirements.txt`, which
-#     `deploy/log_and_deploy.py` bakes into the model artifact together with the
+#     `deploy/deploy_agent.py` bakes into the model artifact together with the
 #     shared governance wheel. The `dependencies` below mirror it for local
 #     development and CI and must be kept in step with it.
 #   * **The deployed version.** A deployment is identified by its Unity Catalog
@@ -104,9 +104,8 @@ known-first-party = ["supervisor"]
 # validates it at construction against
 # `^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*){0,2}$`, so nothing carrying
 # a quote, a semicolon, whitespace or a comment marker can reach these strings.
-"libs/agent_governance/src/agent_governance/config_store.py" = ["S608"]
-"libs/agent_governance/src/agent_governance/audit.py" = ["S608"]
-"libs/agent_governance/src/agent_governance/review_queue.py" = ["S608"]
+"libs/agent_governance/src/agent_governance/governed_config_store.py" = ["S608"]
+"libs/agent_governance/src/agent_governance/audit_trail.py" = ["S608"]
 
 # ── S101 / S105 / S106: asserts and literal secrets, in tests only ───────────
 # `assert` is how a test states its expectation. The two hardcoded-password

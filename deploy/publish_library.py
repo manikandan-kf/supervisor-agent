@@ -1,7 +1,7 @@
 """Publish the shared governance wheel to the platform's Unity Catalog volume.
 
 `databricks bundle deploy` builds `libs/agent_governance/dist/*.whl`. The supervisor never reads
-the volume (its deploy bakes the same wheel into the model artifact, see log_and_deploy.py); the
+the volume (its deploy bakes the same wheel into the model artifact, see deploy_agent.py); the
 worker agents install their copy from here, so every agent runs one tested library. Runs as the
 DAB job task `publish_library`, or by hand with `--catalog/--schema/--volume`. A version already
 present is left alone unless `--overwrite`: another agent may have pinned it, and one version

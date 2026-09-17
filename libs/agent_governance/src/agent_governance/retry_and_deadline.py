@@ -1,9 +1,9 @@
 """The turn's time budget, and the bounded retries that must fit inside it.
 
-Governance Blueprint Stage 05 (bound the blocking call): `Deadline` / `deadline_for` hold the
+Solution §05 (code failsafes: bound the blocking call): `Deadline` / `deadline_for` hold the
 turn's budget, `invoke_with_retries` is the per-call retry that must fit inside it, re-checked
 before every attempt and backoff sleep. Per-call bounds multiply - 4 agents x 30s x 3 attempts =
-361s against a 180s gateway - and an overrun loses the audit row. Retries live here because a
+361s against a 180s caller timeout - and an overrun loses the audit row. Retries live here because a
 LangGraph `RetryPolicy` fires only on a raised exception, and both model-backed nodes fail closed.
 """
 
@@ -108,7 +108,7 @@ T = TypeVar("T")
 
 
 def _default_attempts() -> int:
-    """`Settings.governance_llm_attempts`, read per call (env-per-call, like `prompt_provider`)
+    """`Settings.governance_llm_attempts`, read per call (env-per-call, like `prompt_registry`)
     so engines built from governed config need no extra constructor plumbing to honour it."""
     try:
         return max(1, int(os.getenv("GOVERNANCE_LLM_ATTEMPTS", "3")))

@@ -18,7 +18,6 @@ from helpers import (  # noqa: E402
     REGISTRY,
     StubAudit,
     StubGuardrails,
-    StubReviews,
     StubRouter,
     StubWorkers,
 )
@@ -38,7 +37,6 @@ def make_graph():
         router=None,
         workers=None,
         audit=None,
-        reviews=None,
         settings=None,
         memory=None,
         output_guard=None,
@@ -55,7 +53,6 @@ def make_graph():
             # allowlist is the registry's declared context keys, so tests
             # exercise the real §04 validation rather than an open store.
             memory=memory or LongTermMemory(InMemoryStore(), allowed_keys=REGISTRY.context_keys()),
-            reviews=reviews if reviews is not None else StubReviews(),
         )
         if output_guard is not None:
             services.output_guard = output_guard

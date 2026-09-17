@@ -7,6 +7,144 @@ Notable changes to the supervisor agent. The format follows
 The version here identifies the **source**. A running deployment is identified
 by its Unity Catalog registered-model version, assigned at deploy time.
 
+## [1.3.0] — 2026-09-17
+
+Scope pass against the v1.2 solution document and the Databricks platform.
+Every file was reviewed for who owns the concern — the platform, the calling
+application, or this repository — and what the platform does natively is now
+written down in the README (§1) instead of reimplemented here. What the
+solution does not ask for is gone. Shared library 0.2.0 → 0.3.0.
+
+### Removed
+
+- **`agent_governance.locking`** and the busy-turn path in the entrypoint,
+  together with `lakebase.lock_connection_source` and the second Postgres pool
+  it kept. Model Serving does not serialize turns per conversation, and the
+  caller sends one turn per conversation at a time (DEPLOYMENT.md §7e); the
+  lock held a connection for the whole turn to guard against a caller that does
+  not exist. `THREAD_LOCK_ENABLED`, `THREAD_LOCK_TIMEOUT_SECONDS` and
+  `THREAD_LOCK_POLL_SECONDS` are gone.
+- **`agent_governance.trust`** (HMAC over entitlements and dispatches) and the
+  `verified` context flag. The endpoint ACL is the trust boundary: only the
+  caller's service principal holds CAN QUERY on this endpoint, and only the
+  supervisor's service identity holds CAN QUERY on a worker.
+  `SUPERVISOR_TRUST_SECRET` is gone, and DEPLOYMENT.md §7e states what the
+  calling application is responsible for instead.
+- **`agent_governance.observability`** (JSON log formatter with per-turn ids).
+  The MLflow trace carries the request id, conversation id, user and outcome,
+  and is persisted to Unity Catalog; the container log needs no second copy.
+- **`agent_governance.spend`** (per-turn and per-subject model-call ceilings),
+  the `spend` state channel, `TURN_MAX_MODEL_CALLS`, `TURN_MAX_TOKENS`,
+  `SUBJECT_MAX_MODEL_CALLS`, `SUBJECT_MAX_TOKENS`,
+  `SUBJECT_SPEND_WINDOW_SECONDS`, and the `model_calls` / `tokens_estimated`
+  audit values. Token usage is on every LLM span of the trace, so the §07 KPI
+  is a query; worker cost is each agent's own (§01 assumptions).
+- **`agent_governance.retention`** (erasure and sweep functions). Operator
+  tooling; the SQL for a retention sweep and a subject erasure is in
+  DEPLOYMENT.md §9.
+- **The appeal path.** A guardrail block is final: the `appealable` state
+  channel, the "reply with **appeal**" note, the pre-screen recognition of the
+  word and the verdict's `safety_refusal` field (whose only job was deciding
+  whether to offer an appeal) are gone. A block now states the scope limit and
+  what the caller's role can reach, and the turn ends there. A deliberate
+  departure from solution §05 ("offers an appeal path to a human/admin queue"),
+  recorded in README §3.
+- **`agent_governance.review_queue`** and the conversation hold. "Escalate to a
+  human" (the clarification cap, the `escalate` rules, the output guard's
+  escalate tier, the block streak) is now the `escalated` outcome written
+  synchronously to the audit table, and the conversation continues. The
+  `open_review` state channel, the `review_pending` outcome,
+  `REVIEW_QUEUE_TABLE`, the `supervisor_review_queue` table, its grants and the
+  `reviews` privilege entry are gone. A reviewer surface belongs to the calling
+  application and reads escalations from the audit table.
+- **`agent_governance.grounding`** and `OUTPUT_PROVENANCE_NOTES`. The footnote
+  on unbacked claims is not in the solution.
+- **Streaming.** `predict_stream` no longer relays worker tokens, streams a
+  progress checklist or emits a sources channel; it runs the same synchronous
+  turn as `predict` (solution §02 pattern 01) and emits the finished answer as
+  one event, which is what stream-capable callers such as the AI Playground
+  need. Gone with it: `StreamGuard` and the `stream_*` guard methods,
+  `OUTPUT_STREAM_WORKER_TOKENS`, `OUTPUT_STREAM_HOLDBACK_CHARS`, `progress()`
+  and `progress_sources()` and every call to them in the nodes.
+- **Session notes** (`session_notes.py`, `SESSION_NOTES_MAX`,
+  `SESSION_NOTE_MAX_CHARS`, the `session_notes` state channel). "Keep this in
+  mind for later" is not in the solution.
+- **Every token cap.** `WORKER_MAX_TOKENS`, the simulated worker's generation
+  cap, is gone on top of `spend` above. The endpoint runs as one service
+  principal, so a per-user token limit belongs in the calling application,
+  which is the side that knows the user; token usage stays on the MLflow trace.
+  The two history windows (`SUPERVISOR_HISTORY_MAX_TOKENS`,
+  `WORKER_HISTORY_MAX_TOKENS`) remain — they size the conversation replayed
+  into a prompt, not usage — as does `INPUT_MAX_CHARS`.
+- Sixteen environment variables in all, so an existing deployment can be diffed
+  against this list: `THREAD_LOCK_ENABLED`, `THREAD_LOCK_TIMEOUT_SECONDS`,
+  `THREAD_LOCK_POLL_SECONDS`, `SUPERVISOR_TRUST_SECRET`,
+  `TURN_MAX_MODEL_CALLS`, `TURN_MAX_TOKENS`, `SUBJECT_MAX_MODEL_CALLS`,
+  `SUBJECT_MAX_TOKENS`, `SUBJECT_SPEND_WINDOW_SECONDS`, `WORKER_MAX_TOKENS`,
+  `REVIEW_QUEUE_TABLE`, `OUTPUT_PROVENANCE_NOTES`,
+  `OUTPUT_STREAM_WORKER_TOKENS`, `OUTPUT_STREAM_HOLDBACK_CHARS`,
+  `SESSION_NOTES_MAX` and `SESSION_NOTE_MAX_CHARS`. Setting one now has no
+  effect; none is required.
+
+### Added
+
+- **`DEPLOY-RUNBOOK.md`** — the deploy walked through end to end: prerequisites,
+  the bundle targets, the four job tasks, the Lakebase grants that need an
+  admin, and what to check in the AI Playground once the endpoint is `READY`,
+  including the two failures this workspace actually hits (`agents.deploy()`
+  and the Lakebase resource permission).
+- **`updated-technical-solution/`** — the v1.2 solution document the code is
+  traced against, kept in the repository so every `§` reference in a comment
+  resolves to something a reader can open.
+
+### Changed
+
+- Renamed so the file name says what the file is for. Supervisor: `agent.py` →
+  `serving_entrypoint.py` (the path the deploy script logs), `messages.py` →
+  `user_facing_text.py`, `routing.py` → `context_resolver.py` (class `Router` →
+  `ContextResolver`, and the protocol of that name in `services.py` →
+  `ResolvesContext`), `model_provider.py` → `llm_provider.py`,
+  `prompt_provider.py` → `prompt_registry.py`, `nodes/limits.py` →
+  `nodes/failsafes.py` (`LimitsMixin` → `FailsafesMixin`), `nodes/turn.py` →
+  `nodes/base.py`, `config.py` → `governed_config.py`, `registry.py` →
+  `agent_registry.py`; `deploy/log_and_deploy.py` → `deploy/deploy_agent.py`,
+  and the job task key with it. Library: `audit.py` → `audit_trail.py`,
+  `resilience.py` → `retry_and_deadline.py`, `config_store.py` →
+  `governed_config_store.py`, `policy_eval.py` → `policy_suite_eval.py`,
+  `sensitive.py` → `sensitive_data.py`. Apart from the two class names above,
+  every rename is a module name only; the public names inside are unchanged.
+- **README rewritten as a file-by-file guide.** §0 states the request contract
+  — the `custom_inputs` the caller sends and every `outcome` the endpoint
+  returns; §1 draws the platform / code boundary; §2 gives every file a
+  "Needed?" verdict, required by the solution or the code, or a product feature
+  that can be removed on its own; §3 lists what goes beyond the solution and
+  the three things deliberately not built.
+- **Comments and documentation name only what is in this repository.** No
+  component of the calling application — its chat UI, its identity provider,
+  its hosting — and no section number of a document that is not here. Where the
+  supervisor depends on its caller the text says "the caller" and states what
+  the caller must send; references are to the v1.2 solution sections (§01–§08)
+  or to plain reasoning. Standards citations (OWASP, NIST, GDPR, SOC 2, PCI)
+  stay, because each one explains a rule.
+- **The library depends on `PyYAML` alone.** `langchain-core` was there for
+  `spend.py`'s token counter.
+- `Settings.guardrails_config`, a property only tests used, is gone; the two
+  tests build the path from `Settings().config_dir` instead. A scan for
+  definitions with no caller outside the tests found nothing else.
+- `agent_governance` is 0.3.0 — modules were removed and renamed, so the
+  version moved with them, and the library README carries the migration table.
+
+### Tests
+
+- 260 tests, from 351. The 91 that went are the tests of the removed modules
+  and behaviours: `test_locking.py` and `test_review_queue.py` are gone,
+  `test_audit.py` is now `test_audit_trail.py`, and the session-notes,
+  grounding, streaming, spend and trust sections came out of the files that
+  owned them. The tests that pinned the appeal path and the review hold were
+  rewritten in place to pin what replaced them — a block is final, and an
+  escalation is an audit row on a conversation that continues. No other test of
+  surviving behaviour changed.
+
 ## [1.2.0] — 2026-09-15
 
 Production-readiness pass. Four controls that existed in design but not in a
@@ -76,7 +214,7 @@ publish.
   (`resilience`), the subject spend window (`spend`), session notes, and the
   RBAC gate's two untested paths — session expiry and the review hold. They pin
   current behaviour, including the wire contract of the signature bytes the
-  Governance Front Door keeps its own copy of. Coverage 67% -> 70%.
+  calling application keeps its own copy of. Coverage 67% -> 70%.
 - **`ruff format` adopted and enforced in CI.** Applied to 42 files; an AST
   fingerprint of all 64 modules, docstrings excluded, is byte-identical before
   and after, which is the proof that only layout changed.

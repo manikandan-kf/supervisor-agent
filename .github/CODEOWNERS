@@ -15,7 +15,7 @@
 /src/supervisor/guardrail_engine.py @<org>/<security-team>
 /src/supervisor/nodes/rbac_gate.py  @<org>/<security-team>
 /src/supervisor/nodes/guardrails.py @<org>/<security-team>
-/src/supervisor/config.py           @<org>/<security-team>
+/src/supervisor/governed_config.py  @<org>/<security-team>
 /src/supervisor/config/             @<org>/<security-team>
 /SECURITY.md                        @<org>/<security-team>
 

@@ -21,7 +21,7 @@ scope:
 
 - the guardrail layers: input screening, prompt handling, memory writes,
   retrieval and worker relay, runtime bounds, and the output screen
-- authorization: the RBAC gate, entitlement and dispatch signing, and the
+- authorization: the RBAC gate, the endpoint ACL it relies on, and the
   invocation surface
 - the decision trail: the audit sink, its hash chain, and what reaches it
 - the governed configuration path: what a published document can change, and
@@ -31,8 +31,8 @@ scope:
 - dependency and supply-chain issues in the pinned set in `requirements.txt`
 
 Out of scope, because they are separate deployables owned elsewhere: the calling
-UI, the front door and its rate limiting, the identity provider, and the worker
-agents' own behaviour within their remit.
+application (its UI, authentication and rate limiting) and the worker agents'
+own behaviour within their remit.
 
 ## Supported versions
 
@@ -53,7 +53,7 @@ Two are worth stating up front, because they look like bugs and are not:
   deploy environment can weaken by exporting a variable is not a control, so the
   guardrail settings stay on their code defaults and `Settings.enforce` refuses
   to serve a deployed environment where one of them is off. The one exception is
-  documented in `deploy/log_and_deploy.py`, and its only non-default value
+  documented in `deploy/deploy_agent.py`, and its only non-default value
   *strengthens* the screen.
 
 ## Handling of sensitive data in a report

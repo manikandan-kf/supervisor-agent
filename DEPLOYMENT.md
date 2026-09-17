@@ -37,10 +37,10 @@ relaxes any of it, and only a workstation uses it.
 | 1 | **Workspace URL** and a user with admin (or near-admin) rights | CLI authentication, bundle deploy, creating the service principal, granting ACLs |
 | 2 | **Unity Catalog**: a catalog, and permission to create **one schema per environment** plus one platform schema in it | Holds the registered model, the prompts, the governed configuration, and the volume the shared library is published to. Defaults to `workspace.supervisor_dev`, `workspace.supervisor_prod` and `workspace.agent_platform` |
 | 3 | **A foundation-model serving endpoint** on your approved model list, pay-per-token | The governance model used for guardrail verdicts and context resolution. Dev and prod may use different tiers |
-| 4 | **Lakebase (Databricks Postgres)** capability | Conversation checkpoints, long-term memory, the governed configuration table, the review queue and the audit sink. One instance serves every environment, separated by Postgres schema |
+| 4 | **Lakebase (Databricks Postgres)** capability | Conversation checkpoints, long-term memory, the governed configuration table and the audit sink. One instance serves every environment, separated by Postgres schema |
 | 5 | **Serverless jobs compute** | Runs the deploy job. Enabled by default on most workspaces |
 | 6 | **Model Serving** enabled | Hosts the agent |
-| 7 | **A service principal** (SCIM-visible) **with one generated secret** | The OAuth M2M identity your front door uses to call the agent endpoint |
+| 7 | **A service principal** (SCIM-visible) **with one generated secret** | The OAuth M2M identity the calling application uses to call the agent endpoint |
 
 **Deliberately not required:** a SQL warehouse, the `databricks-sql-access`
 entitlement for the serving endpoint (its system service principal can never
@@ -81,14 +81,14 @@ the Lakebase instance and the platform schema, which are shared.
 | Job | `supervisor-agent-deploy` | `bundle deploy` |
 | Shared library wheel | `agent_governance-<version>-py3-none-any.whl` | `bundle deploy` (built locally, uploaded with the bundle) |
 | MLflow experiment | `/Shared/supervisor-agent-<env>` | the job |
-| Trace tables | OTel Delta tables in `<catalog>.supervisor_<env>` — the experiment's `trace_location` (solution §08) | the job (`log_and_deploy --trace-catalog-schema`) |
+| Trace tables | OTel Delta tables in `<catalog>.supervisor_<env>` — the experiment's `trace_location` (solution §08) | the job (`deploy_agent --trace-catalog-schema`) |
 | Prompts (3) | `supervisor_domain_screen`, `supervisor_routing`, `supervisor_worker_simulation`, aliased `@<env>` | the job (`register_prompts`) |
-| Registered model | `<catalog>.supervisor_<env>.supervisor_agent`, with the wheel under `wheels/` | the job (`log_and_deploy`) |
-| Serving endpoint | `agents_<catalog>-supervisor_<env>-supervisor_agent` | the job (`log_and_deploy`): `agents.deploy()` by default, the Model Serving SDK with `deploy_method: serving-api` (§6a) |
+| Registered model | `<catalog>.supervisor_<env>.supervisor_agent`, with the wheel under `wheels/` | the job (`deploy_agent`) |
+| Serving endpoint | `agents_<catalog>-supervisor_<env>-supervisor_agent` | the job (`deploy_agent`): `agents.deploy()` by default, the Model Serving SDK with `deploy_method: serving-api` (§6a) |
 | Platform schema + volume | `<catalog>.agent_platform.libs` — **shared** by every agent | the job (`publish_library`) |
 | Lakebase instance | `supervisor-memory` — **shared** across environments | step 5 |
 | Postgres schema | `supervisor_<env>` | the runtime, on the first connection (`CREATE SCHEMA IF NOT EXISTS`) |
-| Postgres tables | checkpoints, store, `supervisor_config`, `supervisor_review_queue`, `supervisor_audit_log`, all inside that schema | the runtime, on first use |
+| Postgres tables | checkpoints, store, `supervisor_config`, `supervisor_audit_log`, all inside that schema | the runtime, on first use |
 
 > **Tracing destination.** The bundle passes `--trace-catalog-schema
 > ${var.catalog}.${var.schema}`, so MLflow traces persist as Unity Catalog Delta
@@ -124,7 +124,7 @@ export DATABRICKS_CONFIG_PROFILE="<profile-name>"
 > section empty. Giving `[DEFAULT]` the same host as a named profile makes every
 > SDK call fail with *"DEFAULT and \<profile\> match \<host\> … Use --profile"*.
 
-Create the identity your front door will use to call the agent:
+Create the identity the calling application will use to call the agent:
 
 ```
 databricks service-principals create --display-name "supervisor-platform-api" --active
@@ -134,7 +134,7 @@ databricks service-principal-secrets-proxy create <scim-id>
 ```
 
 The secret is shown **once**. Record it in your secret store. Put the
-application id and secret wherever your front door reads its credentials from.
+application id and secret wherever the calling application reads its credentials from.
 
 Pre-flight, before going further:
 
@@ -178,7 +178,7 @@ Physical isolation instead of schema isolation is a second instance plus
 If your workspace creates Autoscaling-generation instances (project/branch
 rather than a provisioned instance), set `LAKEBASE_AUTOSCALING_ENDPOINT` or
 `LAKEBASE_PROJECT` / `LAKEBASE_BRANCH` in the deploy shell instead of relying
-on `LAKEBASE_INSTANCE`; `log_and_deploy.py` passes them to the container.
+on `LAKEBASE_INSTANCE`; `deploy_agent.py` passes them to the container.
 
 ---
 
@@ -194,7 +194,7 @@ databricks bundle run supervisor_agent_deploy -t dev
 `libs/agent_governance` before uploading, so the machine running it needs
 Python and `pip` on the path.
 
-Four tasks. Three run in parallel, then `log_and_deploy` once the prompts and
+Four tasks. Three run in parallel, then `deploy_agent` once the prompts and
 the configuration are in place:
 
 | Task | What it does |
@@ -202,10 +202,10 @@ the configuration are in place:
 | `register_prompts` | Registers the three prompts and points the target's alias at them |
 | `publish_config` | Seeds `supervisor_config` from `src/supervisor/config/*.yaml`, so the agent is governed before it first serves. Creates the environment's Postgres schema as a side effect |
 | `publish_library` | Copies the library wheel to `/Volumes/<catalog>/agent_platform/libs/` for the other agents. Skips a version already there |
-| `log_and_deploy` | Logs the model with the wheel baked in under `wheels/`, registers it in Unity Catalog, and deploys the serving endpoint |
+| `deploy_agent` | Logs the model with the wheel baked in under `wheels/`, registers it in Unity Catalog, and deploys the serving endpoint |
 
 Expect **10–15 minutes**, almost all of it the serving-container build.
-`log_and_deploy` returns when the rollout is *initiated*, not when it is
+`deploy_agent` returns when the rollout is *initiated*, not when it is
 serving (pass `--wait-minutes 40` to make the job block until `READY` and fail
 otherwise) — so wait for it explicitly before verifying anything:
 
@@ -220,10 +220,10 @@ cause; the commonest is the account's served-entity cap.
 
 Repeat the whole step with `-t prod` for the production environment.
 
-> Several log lines from `log_and_deploy` look alarming and are expected: the
+> Several log lines from `deploy_agent` look alarming and are expected: the
 > job validates the model with a test prediction that runs **without** the
 > endpoint's environment, so it reports an in-memory checkpointer, a
-> process-log-only audit sink, no review queue, and a failed worker dispatch.
+> process-log-only audit sink, and a failed worker dispatch.
 > Confirm those on the endpoint in §8, not from the job log.
 
 > **Do not start a second deploy while a rollout is in progress.**
@@ -233,7 +233,7 @@ Repeat the whole step with `-t prod` for the production environment.
 
 ### 6a. If `agents.deploy()` fails in your workspace
 
-`log_and_deploy` has two ways to create the endpoint. The default calls
+`deploy_agent` has two ways to create the endpoint. The default calls
 `databricks.agents.deploy()`, which does four things: creates the endpoint,
 requests AI Gateway inference tables **in the same create call**, stamps the
 tracing variables, and registers the deployment with the Agent Framework REST
@@ -261,7 +261,7 @@ databricks bundle deploy -t dev --var deploy_method=serving-api
 databricks bundle run supervisor_agent_deploy -t dev
 ```
 
-By hand: `python deploy/log_and_deploy.py … --deploy-method serving-api`.
+By hand: `python deploy/deploy_agent.py … --deploy-method serving-api`.
 Add `--wait-minutes 40` to make the job block until the endpoint is `READY`
 and fail if it is not, instead of returning when the rollout is initiated.
 
@@ -326,11 +326,6 @@ GRANT  SELECT                                                ON supervisor_confi
 -- The audit trail is append-only from the data plane.
 REVOKE UPDATE, DELETE, TRUNCATE, TRIGGER, REFERENCES         ON supervisor_audit_log FROM "<role>";
 GRANT  INSERT, SELECT                                        ON supervisor_audit_log TO   "<role>";
-
--- A review is opened by the supervisor and resolved by the gateway, so the
--- runtime keeps INSERT and UPDATE. DELETE is nobody's business.
-REVOKE DELETE, TRUNCATE, TRIGGER, REFERENCES                 ON supervisor_review_queue FROM "<role>";
-GRANT  INSERT, SELECT, UPDATE                                ON supervisor_review_queue TO   "<role>";
 ```
 
 `TRIGGER` is the one that matters: it would let the serving identity attach a
@@ -346,14 +341,13 @@ SELECT table_name, privilege_type
   FROM information_schema.role_table_grants
  WHERE grantee = '<role>'
    AND table_schema = 'supervisor_dev'
-   AND table_name IN ('supervisor_config','supervisor_audit_log','supervisor_review_queue')
+   AND table_name IN ('supervisor_config','supervisor_audit_log')
  ORDER BY table_name, privilege_type;
 ```
 
 Expected exactly: `SELECT` on `supervisor_config`; `INSERT, SELECT` on
-`supervisor_audit_log`; `INSERT, SELECT, UPDATE` on `supervisor_review_queue`.
-The `table_schema` filter matters: the same three table names exist in every
-environment's schema.
+`supervisor_audit_log`. The `table_schema` filter matters: the same table
+names exist in every environment's schema.
 
 Nothing in the request path writes configuration, so this breaks no runtime
 behaviour: the only writer is the `publish_config` task, which runs as you.
@@ -386,40 +380,19 @@ the volume:
 databricks grants update volume <catalog>.agent_platform.libs --json '{"changes":[{"principal":"<consumer-deploy-identity>","add":["READ_VOLUME"]}]}'
 ```
 
-### 7e. The gateway trust secret — without it, RBAC is self-asserted
+### 7e. What the calling application is responsible for
 
-`permitted_agents` and `approvable_agents` arrive in `custom_inputs`, and the
-RBAC gate treats a supplied set as authoritative (`nodes.rbac_gate`): a caller
-that names its own permitted set is authorized against that set, not against
-`rbac.yaml`. What makes that safe is the HMAC the Governance Front Door signs
-the entitlement block with — `trust.verify_entitlements` checks it and the gate
-refuses an unverified turn.
+The endpoint trusts `permitted_agents`, `approvable_agents`, `user_role` and
+`user_id` in `custom_inputs` because **only the caller's service principal
+holds CAN QUERY** (§7a). That ACL is the trust boundary; keep it to that one
+principal. Three things the supervisor deliberately does not do, because the
+caller is the right place for them (solution §04, §05):
 
-**That check is dark until `SUPERVISOR_TRUST_SECRET` is set on the endpoint.**
-Until then any principal holding `CAN QUERY` (§7a) can invoke the endpoint
-directly with an entitlement block of its choosing and reach any worker agent
-the registry knows about. The bound on the blast radius is §7a — keep `CAN
-QUERY` to the Platform API's service principal alone — but that is one ACL
-standing where two controls were designed.
-
-Generate a secret, store it in a Databricks secret scope, and export it in the
-deploy shell; `log_and_deploy.py` passes it to the endpoint:
-
-```bash
-databricks secrets create-scope supervisor
-databricks secrets put-secret supervisor trust-secret --string-value "$(openssl rand -hex 32)"
-
-# in the deploy shell, before `bundle run`
-export SUPERVISOR_TRUST_SECRET="$(databricks secrets get-secret supervisor trust-secret --output json | jq -r .value | base64 -d)"
-```
-
-The **same** value must be configured on the Governance Front Door, which signs
-with `trust.sign_entitlements`. Rotate both together: a mismatch fails closed —
-every turn is refused as unverified — so rotate in a maintenance window, or
-teach the gateway to sign with the new secret before the endpoint requires it.
-
-Verify by sending an unsigned request with an invented entitlement block. It
-must come back as the generic RBAC denial, not an answer.
+| Responsibility | Why it lives in the caller |
+|---|---|
+| Validate the payload and resolve the target agent | Malformed requests are rejected with a 4xx before they reach the graph |
+| Rate-limit per user and per API key | AI Gateway rate limits are not available on agent endpoints; the caller sees every user |
+| **Send one turn per conversation at a time** | Model Serving runs concurrent requests on any replica with no session affinity. Two turns on one `conversation_id` in flight together would both load the same checkpoint and the second write wins. The caller holds a turn until the previous one for that conversation has returned |
 
 ---
 
@@ -478,7 +451,7 @@ present and `requirements.txt` ends with that same relative path.
 | `agents.yaml`, `rbac.yaml`, `guardrails.yaml` | `python deploy/publish_config.py --apply --lakebase-instance supervisor-memory --lakebase-schema supervisor_<env>` — a table write, into that environment's schema only. A running endpoint picks it up within the configuration cache TTL. **No redeploy** |
 | `src/supervisor/**` or `deploy/**` | `databricks bundle deploy -t <env>` → `databricks bundle run supervisor_agent_deploy -t <env>` → wait (§6) |
 | `libs/agent_governance/**` | Bump `agent_governance.__version__`, then the same redeploy: the new wheel is baked into the new model version and published to the volume. Consumers pick up the new version when they choose to |
-| Prompt text in `prompt_provider.py` | Same redeploy. While the endpoint uses the bundled fallback, a prompt change reaches it by redeploy, not by moving a registry alias |
+| Prompt text in `prompt_registry.py` | Same redeploy. While the endpoint uses the bundled fallback, a prompt change reaches it by redeploy, not by moving a registry alias |
 | `databricks.yml` variables | `bundle deploy` then `bundle run` again |
 | A **new** environment | Add the target to `databricks.yml` — every name derives from `${bundle.target}`. Then §6 with `-t <env>` and §7's grants for the new endpoint |
 
@@ -490,48 +463,34 @@ the entry to `agents.yaml` and the role mapping to `rbac.yaml`, publish to each
 environment you want it in, and grant the corresponding role in your identity
 provider.
 
-**Retention and erasure.** Both are `agent_governance.retention`, called from a
-notebook or a scheduled job running as the **table owner** — the §7b grants
-deliberately leave the serving identity without DELETE, so the endpoint cannot
-do this and that is the point. There is no CLI wrapper in this repository on
-purpose: it would be an operator script that has to be kept in step with the
-library for no behaviour of its own.
+**Retention.** Nothing on the platform purges Lakebase checkpoints, and the
+runtime evaluates session expiry and long-term memory TTL lazily *on read*, so
+an abandoned conversation stops being used but its rows stay. Schedule this as
+a SQL job running as the **table owner** (the §7b grants deliberately leave the
+serving identity without DELETE). It uses the audit trail's `event_time` to
+find idle conversations, because the checkpoint tables carry no timestamp:
 
-Nothing is deleted without `apply=True`, every applied run writes a row to the
-audit trail through the runtime's own sink (so the hash chain stays valid), and
-an erasure re-reads the keys afterwards and raises rather than reporting an
-erasure it did not complete.
+```sql
+SET search_path TO supervisor_<env>;
 
-```python
-from agent_governance import retention
-from supervisor.memory import audit_connection_source
-from supervisor.settings import Settings
+-- Conversations with no turn in the last 180 days.
+CREATE TEMP TABLE stale AS
+  SELECT conversation_id FROM supervisor_audit_log
+   WHERE conversation_id <> ''
+   GROUP BY conversation_id
+  HAVING max(event_time) < now() - interval '180 days';
 
-settings = Settings()
-table = settings.audit_pg_table
-source = audit_connection_source()          # the environment's schema, per LAKEBASE_SCHEMA
-sink = retention.default_audit_logger(source, table)
-
-# retention sweep: conversations idle longer than N days
-print(retention.sweep_conversations(source, table, 180, audit_logger=sink))
-print(retention.sweep_conversations(source, table, 180, audit_logger=sink, apply=True))
-
-# what is held for one subject, then the erasure itself
-print(retention.erase_subject(source, "usr_ab12", table, audit_logger=sink))
-print(retention.erase_subject(source, "usr_ab12", table, audit_logger=sink,
-                              apply=True, requested_by="alice@corp"))
+DELETE FROM checkpoint_writes WHERE thread_id IN (SELECT conversation_id FROM stale);
+DELETE FROM checkpoint_blobs  WHERE thread_id IN (SELECT conversation_id FROM stale);
+DELETE FROM checkpoints       WHERE thread_id IN (SELECT conversation_id FROM stale);
 ```
-
-Wire the sweep as a scheduled job. Without one, checkpoints accumulate for the
-life of the deployment: session expiry and long-term memory TTL are evaluated
-lazily *on read*, so an abandoned conversation stops being used and its rows
-stay exactly where they are.
 
 The audit rows themselves are never deleted. They carry no message text — the
 decision trail is redacted before it is written — and they are the record that
-the subject's requests were governed.
+the subject's requests were governed. MLflow trace tables and inference tables
+have no automatic purge either; set a retention job on them in the same way.
 
-**Verifying the decision trail.** `agent_governance.audit.verify_chain` walks
+**Verifying the decision trail.** `agent_governance.audit_trail.verify_chain` walks
 the hash chain and reports whether history is intact; record its `head_id` and
 `head_hash` somewhere outside operator write scope (a ticket, a signed commit)
 so a clean result proves something. Schedule it alongside the sweep.
@@ -585,14 +544,14 @@ rows gone.
 | Symptom | First thing to check |
 |---|---|
 | `bundle deploy` → *"no wheel"* / build error under `libs/agent_governance` | Python and `pip` on the local path; `python -m pip wheel --no-deps --wheel-dir libs/agent_governance/dist libs/agent_governance` by hand shows the real error |
-| `log_and_deploy` → `ModuleNotFoundError: agent_governance` | The job environment did not install the wheel — the `dependencies` glob in `resources/deploy_job.yml` must match a built file |
+| `deploy_agent` → `ModuleNotFoundError: agent_governance` | The job environment did not install the wheel — the `dependencies` glob in `resources/deploy_job.yml` must match a built file |
 | Endpoint build log → *"No such file: wheels/agent_governance-…whl"* | The wheel was not logged next to the model. Check the registered version's artifacts; it is written by `log_model_artifacts` *before* `register_model` |
 | `bundle run` → *"Triggering new runs … is currently disabled temporarily"* | Account credits or entitlements, not the bundle |
 | A job task dies with `NameError: name '__file__' is not defined` | Serverless `exec`s the script rather than importing it. Use the `_repo_root()` fallback the deploy scripts carry |
 | A task's log shows success but the task is `FAILED` with `SystemExit: 0` | The script exited explicitly on success. Exit only on a real failure code |
-| `log_and_deploy` → *"Endpoint … is currently updating"* | A previous rollout is still in progress. Wait for `NOT_UPDATING`, then re-run |
+| `deploy_agent` → *"Endpoint … is currently updating"* | A previous rollout is still in progress. Wait for `NOT_UPDATING`, then re-run |
 | *"Could not open requirements file"* in the job | A stale `.databricks/` sync snapshot from another workspace. Delete the folder and redeploy |
-| Callers get 403 / "agent unavailable" while your own calls work | §7a — you authenticate as you, the front door as the service principal |
+| Callers get 403 / "agent unavailable" while your own calls work | §7a — you authenticate as you, the calling application as the service principal |
 | Endpoint log says it fell back to bundled prompts | §7c. Harmless while the registry text matches the bundled text |
 | Audit table empty | Check `search_path` — you may be reading a different environment's schema from the one the endpoint writes to |
 | Conversation history lost between turns | The endpoint has no Lakebase instance — check the variable reached it, and that the instance is AVAILABLE |
@@ -608,8 +567,6 @@ SET search_path TO supervisor_dev;
 ALTER TABLE supervisor_audit_log ADD COLUMN IF NOT EXISTS latency_ms INTEGER;
 ALTER TABLE supervisor_audit_log ADD COLUMN IF NOT EXISTS session_age_seconds DOUBLE PRECISION;
 ALTER TABLE supervisor_audit_log ADD COLUMN IF NOT EXISTS signoff JSONB;
-ALTER TABLE supervisor_audit_log ADD COLUMN IF NOT EXISTS model_calls INTEGER;
-ALTER TABLE supervisor_audit_log ADD COLUMN IF NOT EXISTS tokens_estimated INTEGER;
 ALTER TABLE supervisor_audit_log ADD COLUMN IF NOT EXISTS provenance JSONB;
 ALTER TABLE supervisor_audit_log ADD COLUMN IF NOT EXISTS prev_hash TEXT;
 ALTER TABLE supervisor_audit_log ADD COLUMN IF NOT EXISTS row_hash TEXT;
@@ -627,12 +584,12 @@ same governance code as the supervisor. Their deploy job:
    (or names that path in the job environment's `dependencies`).
 2. Logs the same file next to their model — `wheels/<file>.whl` in the model's
    `pip_requirements`, the file added with `MlflowClient().log_model_artifacts`
-   before `register_model` — exactly as `deploy/log_and_deploy.py` does here.
-3. In code: `from agent_governance.trust import trust_secret, verify_dispatch`
-   to check the supervisor's dispatch signature,
-   `agent_governance.sanitize` on inbound text, `agent_governance.output_guard`
-   on every reply, and `agent_governance.audit` for the decision trail. The
-   library's README lists the module map.
+   before `register_model` — exactly as `deploy/deploy_agent.py` does here.
+3. In code: `agent_governance.sanitize` on inbound text,
+   `agent_governance.output_guard` on every reply, and `agent_governance.audit_trail`
+   for the decision trail. The library's README lists the module map. A worker
+   trusts a dispatch because only the supervisor endpoint's service identity
+   holds CAN QUERY on it — grant nothing else.
 
 Pin the version. A wheel on the volume is never overwritten under the same
 name, so a pinned consumer cannot change under you.

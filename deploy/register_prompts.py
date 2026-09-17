@@ -1,9 +1,9 @@
-"""Register the supervisor's prompts in MLflow Prompt Registry (§4.1).
+"""Register the supervisor's prompts in the MLflow Prompt Registry.
 
-§4.1: each prompt change is an immutable registry version promoted by alias; the in-repo
-templates in `prompt_provider.py` are the offline fallback and the initial version. Prompts live
+Each prompt change is an immutable registry version promoted by alias; the in-repo
+templates in `prompt_registry.py` are the offline fallback and the initial version. Prompts live
 in Unity Catalog, so the URI is `databricks-uc` and names are three-part (mirrored in
-`prompt_provider.prompt_uri`). Re-running is safe: an unchanged template is skipped. Rollback is
+`prompt_registry.prompt_uri`). Re-running is safe: an unchanged template is skipped. Rollback is
 `--pin`, which only re-points the alias. A moved alias reaches a running endpoint within MLflow's
 alias cache TTL (60s); `get_prompt` is not process-cached, so a promotion never needs a redeploy.
 """
@@ -43,8 +43,8 @@ def _prompt_specs() -> dict[str, dict]:
     `response_format` is the structured-output contract the code holds the model to; registering
     it with the version means schema and instructions are promoted and rolled back together.
     """
+    from supervisor.context_resolver import RouteDecision
     from supervisor.guardrail_engine import GuardrailVerdict
-    from supervisor.routing import RouteDecision
 
     return {
         "supervisor_domain_screen": {
@@ -143,7 +143,7 @@ def main() -> int:
         "--promote",
         action="store_true",
         help="move the alias onto the version just registered. Required for any "
-        "alias outside DEV, where §4.1 wants an evaluation run in between",
+        "alias outside DEV, where an evaluation run belongs in between",
     )
     parser.add_argument(
         "--no-promote",
@@ -153,7 +153,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    # §4.1: every prompt change is an immutable version "evaluated before manual promotion", and
+    # Every prompt change is an immutable version, evaluated before manual promotion, and
     # only authorized owners move production aliases. Registering and promoting in one step let
     # nothing run between them; DEV stays a single command (not a production alias), QA/PROD gate.
     auto_promote = args.alias.strip().lower() in {"dev", "development"}
@@ -161,7 +161,7 @@ def main() -> int:
 
     import mlflow
 
-    from supervisor.prompt_provider import bundled_default, prompt_names
+    from supervisor.prompt_registry import bundled_default, prompt_names
 
     mlflow.set_registry_uri("databricks-uc")
 
@@ -208,8 +208,8 @@ def main() -> int:
             tags = {
                 "source": "deploy/register_prompts.py",
                 "component": "supervisor",
-                # MLflow's enterprise pair: owner and purpose. The owner is whoever §4.1 lets
-                # move production aliases, so it is configuration, not code.
+                # MLflow's enterprise pair: owner and purpose. The owner is whoever may move
+                # production aliases, so it is configuration, not code.
                 "author": os.getenv("PROMPT_OWNER", "supervisor-agent-team"),
                 "use_case": spec.get("use_case", "supervisor"),
             }

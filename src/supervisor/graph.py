@@ -2,7 +2,7 @@
 
 The stage order — RBAC gate, Guardrails, Route/Clarify, Dispatch, Respond &
 Audit — is built into the graph and cannot be skipped. The target agent arrives
-fixed on every invocation (widgets are per-agent), so the supervisor verifies
+fixed on every invocation (the caller names one agent), so the supervisor verifies
 and clarifies rather than selects; the RBAC gate revalidates it every call.
 No conditional-edge functions: each node returns a `Command[Literal[...]]`, so a
 decision and its consequence live together and targets are checked at build time.
@@ -18,7 +18,7 @@ from .services import Services, build_services
 from .state import SupervisorContext, SupervisorState
 
 # Deliberately no graph-level RetryPolicy: it fires only on *raised* exceptions and
-# the model nodes catch everything to fail closed. Retries: `resilience.invoke_with_retries`.
+# the model nodes catch everything to fail closed. Retries: `retry_and_deadline.invoke_with_retries`.
 
 
 def build_graph(services: Services | None = None, checkpointer=None, store=None):

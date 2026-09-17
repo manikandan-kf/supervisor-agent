@@ -1,6 +1,6 @@
 """Log the supervisor as an MLflow model, register it in Unity Catalog, deploy it on Serving.
 
-Run as the DAB job task, or locally: `python deploy/log_and_deploy.py --uc-model <c.s.m>`.
+Run as the DAB job task, or locally: `python deploy/deploy_agent.py --uc-model <c.s.m>`.
 `--deploy-method agents` (default) uses `databricks.agents.deploy()`; `serving-api` drives the
 Model Serving SDK directly for workspaces where the Agent Framework registration or the AI
 Gateway permission check fails. Endpoint credentials come from the logged `resources` either
@@ -275,7 +275,7 @@ def main() -> None:
         "--lakebase-instance",
         default=os.getenv("LAKEBASE_INSTANCE", ""),
         help="Lakebase database instance for durable conversation memory, long-term "
-        "memory, the governed config table, the review queue and the audit sink. "
+        "memory, the governed config table and the audit sink. "
         "Declared as a model resource so the endpoint's service identity can mint "
         "database credentials, and passed to the container as LAKEBASE_INSTANCE.",
     )
@@ -408,7 +408,7 @@ def main() -> None:
         os.environ["PROMPT_CATALOG_SCHEMA"] = args.prompt_catalog_schema
         os.environ["PROMPT_ALIAS"] = args.prompt_alias or args.environment
 
-        from supervisor.prompt_provider import prompt_names, prompt_uri
+        from supervisor.prompt_registry import prompt_names, prompt_uri
 
         prompt_uris = [prompt_uri(name) for name in prompt_names()]
         print(f"Linking {len(prompt_uris)} prompt versions to the model: {prompt_uris}")
@@ -424,7 +424,7 @@ def main() -> None:
             **({"prompts": prompt_uris} if prompt_uris else {}),
             # as_posix() so the recorded code path stays loadable inside the
             # Linux serving container when logging from Windows.
-            python_model=(ROOT / "src" / "supervisor" / "agent.py").as_posix(),
+            python_model=(ROOT / "src" / "supervisor" / "serving_entrypoint.py").as_posix(),
             code_paths=[str(ROOT / "src" / "supervisor")],
             # The runtime pins plus the library wheel, resolved from the model
             # directory at container build — see the module docstring.
@@ -470,19 +470,14 @@ def main() -> None:
         env_vars["LAKEBASE_SCHEMA"] = args.lakebase_schema
     # Lakebase address and tuning knobs pass through verbatim when set. Guardrail knobs are
     # deliberately absent — a control a deploy shell can weaken is not a control; `Settings.enforce`
-    # refuses to serve with one off. OUTPUT_STREAM_WORKER_TOKENS passes because it only strengthens.
+    # refuses to serve with one off.
     for passthrough in (
         "LAKEBASE_AUTOSCALING_ENDPOINT",
         "LAKEBASE_PROJECT",
         "LAKEBASE_BRANCH",
-        # Gateway HMAC secret (trust.py). Not a guardrail knob: setting it only *strengthens* the
-        # gate (`permitted_agents` must then carry a valid Front Door signature). Without it a
-        # CAN_QUERY principal can assert its own permitted set. Secret scope; DEPLOYMENT.md §7e.
-        "SUPERVISOR_TRUST_SECRET",
         "SUPERVISOR_DURABILITY",
         "SUPERVISOR_HISTORY_MAX_TOKENS",
         "WORKER_HISTORY_MAX_TOKENS",
-        "OUTPUT_STREAM_WORKER_TOKENS",
         # Fallback workspace credentials for the SDK's default chain, used when the
         # declared-resource passthrough cannot be granted — today a Lakebase dependency
         # needs a workspace admin to create the endpoint. Pass `{{secrets/<scope>/<key>}}`

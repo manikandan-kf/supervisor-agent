@@ -7,16 +7,13 @@ Imported by the test modules directly (`from helpers import ...`); the
 from __future__ import annotations
 
 import time
-from dataclasses import replace
-from datetime import datetime, timezone
 
 from agent_governance.rbac import RbacPolicy
-from agent_governance.review_queue import Review, ReviewQueueError
 from langgraph.types import Command
 
+from supervisor.agent_registry import AgentRegistry, WorkerAgent
+from supervisor.context_resolver import RouteResult
 from supervisor.guardrail_engine import GuardrailResult, ScreenResult
-from supervisor.registry import AgentRegistry, WorkerAgent
-from supervisor.routing import RouteResult
 from supervisor.state import SupervisorContext
 from supervisor.worker_client import WorkerResponse
 
@@ -94,7 +91,7 @@ class StubWorkers:
 
 class StubAudit:
     """Records every audit row, and can be made to fail: `fail_on` is a set of outcomes
-    whose write raises, driving the §05 Stage 06 rule that a decision needs its record."""
+    whose write raises, driving the rule that a governance decision needs its record."""
 
     def __init__(self, fail_on=()):
         self.records = []
@@ -106,76 +103,6 @@ class StubAudit:
         if record.get("outcome") in self.fail_on:
             raise RuntimeError("audit sink unavailable")
         self.records.append(record)
-
-
-class StubReviews:
-    """In-memory stand-in for the appeal / escalation queue, closer to the real thing than
-    a mock: the same one-winner semantics Postgres gets from its conditional UPDATE."""
-
-    def __init__(self, fail=False):
-        self.fail = fail
-        self.rows = {}
-        self.opened = []
-        self._n = 0
-
-    def _guard(self):
-        if self.fail:
-            raise ReviewQueueError("review queue unavailable (test)")
-
-    def open_review(self, *, kind, conversation_id, reason, **extra):
-        self._guard()
-        self._n += 1
-        review = Review(
-            ref=f"rev_test_{self._n}",
-            kind=kind,
-            status="open",
-            conversation_id=conversation_id,
-            reason=reason,
-            user_key=extra.get("user_key", ""),
-            user_role=extra.get("user_role", ""),
-            target_agent_id=extra.get("target_agent_id", ""),
-            query_excerpt=extra.get("query_excerpt", ""),
-        )
-        self.rows[review.ref] = review
-        self.opened.append(review)
-        return review
-
-    def resolve(self, ref, *, reviewer, decision, note=""):
-        self._guard()
-        current = self.rows.get(ref)
-        if current is None:
-            raise ReviewQueueError(f"no such review: {ref}")
-        if current.status != "open":
-            raise ReviewQueueError(f"{ref} was already resolved by {current.reviewer}")
-        updated = replace(
-            current,
-            status="resolved",
-            decision=decision,
-            reviewer=reviewer,
-            reviewer_note=note,
-            resolved_at=datetime.now(timezone.utc),
-        )
-        self.rows[ref] = updated
-        return updated
-
-    def claim_allowance(self, conversation_id):
-        self._guard()
-        for ref, review in self.rows.items():
-            if review.conversation_id == conversation_id and review.grants_retry:
-                claimed = replace(review, consumed_at=datetime.now(timezone.utc))
-                self.rows[ref] = claimed
-                return claimed
-        return None
-
-    def get(self, ref):
-        self._guard()
-        return self.rows.get(ref)
-
-    def list_open(self, *, kind="", limit=100):
-        self._guard()
-        return [
-            r for r in self.rows.values() if r.status == "open" and (not kind or r.kind == kind)
-        ][:limit]
 
 
 # ── Credential-shaped fixtures ──────────────────────────────────────────────
@@ -222,7 +149,7 @@ def context_for(
     user_key="user-1",
     started_at=None,
 ):
-    """Runtime context for one turn — identity, never state (§4.4). `started_at` stays a
+    """Runtime context for one turn — identity, never state. `started_at` stays a
     live monotonic reading so tests run the deployed budget; a past value exhausts it,
     0 disables it."""
     return SupervisorContext(
@@ -246,8 +173,8 @@ def invoke(
     user_key="user-1",
     started_at=None,
 ):
-    """One turn through the graph. `agent` is fixed by the invocation path — each chat
-    widget is scoped to one agent, so it always names a concrete worker."""
+    """One turn through the graph. `agent` is fixed by the caller, which always names one
+    concrete worker."""
     return graph.invoke(
         {"messages": [{"role": "user", "content": text}], "conversation_id": thread},
         config={"configurable": {"thread_id": thread}},

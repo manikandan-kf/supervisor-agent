@@ -3,7 +3,7 @@
 Three documents live in the governed table, matching the seeds in `config/`:
 agents (registry.AgentRegistry), rbac (rbac.RbacPolicy), guardrails (deny
 patterns, output policy, canaries, kill switch). Store, checksum, TTL cache and
-fallback rules are `agent_governance.config_store`; this module owns the
+fallback rules are `agent_governance.governed_config_store`; this module owns the
 supervisor-specific validators and the consumer objects built from all three.
 """
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from agent_governance.config_store import (
+from agent_governance.governed_config_store import (
     PROMPT_FIELD_CONTROL,
     PROMPT_FIELD_MARKERS,
     ConfigError,
@@ -162,7 +162,7 @@ def config_store(settings: Settings) -> ConfigStore:
 class SupervisorConfig:
     """The three documents as the objects the graph consumes.
 
-    Accessors are wrapped in `config_store.Reloading` by `services.build_services`,
+    Accessors are wrapped in `governed_config_store.Reloading` by `services.build_services`,
     so a published change reaches a running endpoint within the cache TTL.
     """
 
@@ -180,7 +180,7 @@ class SupervisorConfig:
         )
 
     def registry(self):
-        from .registry import AgentRegistry
+        from .agent_registry import AgentRegistry
 
         return self.provider.built("agents", AgentRegistry.from_mapping)
 
@@ -219,7 +219,7 @@ class SupervisorConfig:
         """
         from agent_governance.output_guard import OutputGuard
 
-        from .prompt_provider import protected_lines
+        from .prompt_registry import protected_lines
 
         return self.provider.built(
             "guardrails",

@@ -1,8 +1,8 @@
-"""Failsafe behaviour required by Solution v1.2 §06 — two rows of that table:
+"""Failsafe behaviour required by Solution v1.2 §05 — two rows of that table:
 
 * model service error → fails closed: the query is held and the user told to retry,
   never treated as an implicit pass;
-* a disputed block → states the scope limitation and offers an appeal path to a queue.
+* a guardrail block → states the scope limitation and is final: no appeal, no re-screen.
 """
 
 from __future__ import annotations
@@ -10,22 +10,16 @@ from __future__ import annotations
 import time
 
 import pytest
-from agent_governance.resilience import (
+from agent_governance.retry_and_deadline import (
     BudgetExhausted,
     Deadline,
     invoke_with_retries,
     is_transient,
 )
-from agent_governance.spend import SpendCaps, SubjectWindow
 from helpers import StubGuardrails, invoke
 
 from supervisor.guardrail_engine import GuardrailResult
-from supervisor.messages import (
-    APPEAL_ACKNOWLEDGED_MESSAGE,
-    APPEAL_NOTE,
-    GOVERNANCE_UNAVAILABLE_MESSAGE,
-)
-from supervisor.settings import Settings
+from supervisor.user_facing_text import GOVERNANCE_UNAVAILABLE_MESSAGE
 
 
 class ExplodingGuardrails:
@@ -83,70 +77,36 @@ def test_failure_is_not_an_implicit_pass(make_graph):
     assert "try again" in text.lower()
 
 
-# ── Appeal path ─────────────────────────────────────────────────────────────
+# ── A block is final ────────────────────────────────────────────────────────
 
 
-def _blocked_graph(make_graph):
-    return make_graph(
-        guardrails=StubGuardrails(GuardrailResult(False, "semantic", "this is out of scope"))
-    )
-
-
-def test_block_offers_an_appeal_path(make_graph):
-    graph, _ = _blocked_graph(make_graph)
-    result = invoke(graph, "Give me a pasta recipe")
-
-    assert result["outcome"] == "blocked"
-    assert APPEAL_NOTE in result["final_text"]
-    # The scope limitation is still stated — the appeal is offered in addition,
-    # not instead.
-    assert "out of scope" in result["final_text"].lower()
-
-
-def test_appeal_reaches_the_human_queue_without_rescreening(make_graph):
-    """Re-screening the word "appeal" would block it again — the silent retry
-    §06 rules out. The appeal is recognised before the screen runs."""
+def test_a_block_states_the_scope_limitation_and_offers_no_appeal(make_graph):
     guardrails = StubGuardrails(GuardrailResult(False, "semantic", "this is out of scope"))
     graph, services = make_graph(guardrails=guardrails)
+    result = invoke(graph, "Give me a pasta recipe", thread="block-1")
 
-    invoke(graph, "Give me a pasta recipe", thread="appeal-1")
+    assert result["outcome"] == "blocked"
+    assert "out of scope" in result["final_text"].lower()
+    assert "appeal" not in result["final_text"].lower()
+    assert "reviewer" not in result["final_text"].lower()
+    assert services.workers.calls == []
+
+
+def test_the_word_appeal_after_a_block_is_screened_like_any_other_message(make_graph):
+    """There is no appeal path: nothing is recognised before the screen, and the block
+    cannot be overturned from the conversation."""
+    guardrails = StubGuardrails(GuardrailResult(False, "semantic", "this is out of scope"))
+    graph, services = make_graph(guardrails=guardrails)
+    invoke(graph, "Give me a pasta recipe", thread="block-2")
     screens_after_block = len(guardrails.calls)
 
-    result = invoke(graph, "appeal", thread="appeal-1")
+    result = invoke(graph, "appeal", thread="block-2")
 
-    assert result["outcome"] == "escalated"
-    assert result["final_text"] == APPEAL_ACKNOWLEDGED_MESSAGE
-    assert len(guardrails.calls) == screens_after_block, "the appeal was re-screened"
-
-    trail = services.audit.records[-1]["decision_trail"]
-    appeal = [e for e in trail if e["decision"] == "appeal"]
-    assert appeal, "the appeal is not in the decision trail for an admin to review"
-    assert "out of scope" in appeal[0]["detail"]
+    assert result["outcome"] == "blocked"
+    assert len(guardrails.calls) == screens_after_block + 1, "the message was not screened"
 
 
-def test_appeal_without_a_preceding_block_is_screened_normally(make_graph):
-    """An unprompted "appeal" is just a message; it must not manufacture an
-    escalation out of nothing."""
-    graph, _ = make_graph()
-    result = invoke(graph, "appeal", thread="appeal-2")
-    assert result["outcome"] != "escalated"
-
-
-def test_a_passing_turn_clears_the_appeal_offer(make_graph):
-    """Once a later request passes the screen, the earlier block is no longer
-    what "appeal" refers to."""
-    guardrails = StubGuardrails(GuardrailResult(False, "semantic", "out of scope"))
-    graph, _ = make_graph(guardrails=guardrails)
-    invoke(graph, "Give me a pasta recipe", thread="appeal-3")
-
-    guardrails.result = GuardrailResult(True, "semantic", "in domain")
-    invoke(graph, "Write an HLD for billing", thread="appeal-3")
-
-    result = invoke(graph, "appeal", thread="appeal-3")
-    assert result["outcome"] != "escalated"
-
-
-# ── Code failsafes: the turn budget and the retry inside it (resilience.py) ──
+# ── Code failsafes: the turn budget and the retry inside it (retry_and_deadline.py) ──
 #
 # §05's "code failsafe" rows: what a transient failure, a permanent one and an
 # exhausted budget each do, so the retry authority cannot become two authorities again.
@@ -254,58 +214,3 @@ def test_what_counts_as_transient():
     assert is_transient(TimeoutError("Read timed out")) is True
     assert is_transient(ConnectionError("connection reset")) is True
     assert is_transient(ValueError("nope")) is False
-
-
-# ── Cost control: one subject's rolling allowance (spend.py) ─────────────────
-
-
-def test_the_shipped_defaults_cap_the_turn_and_leave_the_subject_window_dark():
-    caps = SpendCaps.from_settings(Settings())
-    assert caps.turn_model_calls == 8
-    assert caps.turn_tokens == 60000
-    assert caps.turn_enabled is True
-    assert caps.subject_enabled is False
-
-
-def test_a_dark_subject_window_never_refuses():
-    window = SubjectWindow()
-    assert window.enabled is False
-    window.charge("usr_1", model_calls=50, tokens=500000)
-    assert window.check("usr_1") == ""
-
-
-def test_the_call_allowance_refuses_the_next_turn_not_the_current_one():
-    window = SubjectWindow(SpendCaps(subject_model_calls=2, subject_window_seconds=60))
-    assert window.check("usr_1") == ""
-    window.charge("usr_1", model_calls=2)
-    reason = window.check("usr_1")
-    assert "2 governance model calls" in reason
-    assert "2-call subject allowance" in reason
-    # Another subject is unaffected.
-    assert window.check("usr_2") == ""
-
-
-def test_the_token_allowance_is_independent_of_the_call_allowance():
-    window = SubjectWindow(SpendCaps(subject_tokens=100, subject_window_seconds=60))
-    window.charge("usr_1", tokens=100)
-    assert "~100 governance tokens" in window.check("usr_1")
-
-
-def test_spend_older_than_the_window_stops_counting():
-    window = SubjectWindow(SpendCaps(subject_model_calls=1, subject_window_seconds=0.05))
-    window.charge("usr_1", model_calls=1)
-    assert window.check("usr_1") != ""
-    time.sleep(0.08)
-    assert window.check("usr_1") == ""
-
-
-def test_an_unattributable_caller_is_allowed_through_rather_than_pooled():
-    window = SubjectWindow(SpendCaps(subject_model_calls=1, subject_window_seconds=60))
-    window.charge("", model_calls=5)
-    assert window.check("") == ""
-
-
-def test_zero_charges_leave_no_entry():
-    window = SubjectWindow(SpendCaps(subject_model_calls=1, subject_window_seconds=60))
-    window.charge("usr_1", model_calls=0, tokens=0)
-    assert window.check("usr_1") == ""

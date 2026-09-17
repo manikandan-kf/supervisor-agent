@@ -63,9 +63,6 @@ ALLOWED: Mapping[str, frozenset[str]] = {
     "config": frozenset({SELECT}),
     # The decision trail is append-only.
     "audit": frozenset({INSERT, SELECT}),
-    # A review is opened by the supervisor and resolved by the gateway, so the
-    # runtime keeps UPDATE. DELETE is nobody's business.
-    "reviews": frozenset({INSERT, SELECT, UPDATE}),
 }
 
 

@@ -45,7 +45,7 @@ CATEGORIES: tuple[str, ...] = (
 )
 
 # The vendors' high tier: never delivered raw whatever the local policy says.
-# `config_store` refuses a published policy that sets any of these to `allow`.
+# `governed_config_store` refuses a published policy that sets any of these to `allow`.
 NEVER_ALLOW: frozenset[str] = frozenset(
     {CREDENTIAL, SECRET_ASSIGNMENT, GOVERNMENT_ID, PAYMENT, BANK, HEALTH_ID}
 )

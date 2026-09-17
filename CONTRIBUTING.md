@@ -66,7 +66,7 @@ Neither needs a code change to reach a running endpoint, and both are governed:
   the document and refuses a change that would downgrade a control.
 - **Prompts** are registered in Unity Catalog by
   `python deploy/register_prompts.py`, one alias per environment. The bundled
-  templates in `prompt_provider.py` are the fallback the endpoint uses when the
+  templates in `prompt_registry.py` are the fallback the endpoint uses when the
   registry is unreachable, so a change to a template needs a redeploy as well as
   a registration.
 

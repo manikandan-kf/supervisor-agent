@@ -1,7 +1,6 @@
 """The turn itself — what every stage reads, records and measures about it.
 
-Reading the conversation, shaping an audit entry, timing a session, deciding
-whether the turn narrates. Plus `NodeBase`, the single place the service
+Reading the conversation, shaping an audit entry, timing a session. Plus `NodeBase`, the single place the service
 container is bound so every stage can rely on `self.s`. Not `common.py` or
 `utils.py` on purpose: everything here is about one turn, and anything that is
 not does not belong here.
@@ -10,7 +9,6 @@ not does not belong here.
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
@@ -20,10 +18,7 @@ from agent_governance.sanitize import (
     neutralise_embedded_directives,
     neutralise_history_text,
 )
-from agent_governance.sensitive import redact_text
-from agent_governance.spend import (
-    TurnSpend,
-)
+from agent_governance.sensitive_data import redact_text
 from langchain_core.messages.utils import count_tokens_approximately, trim_messages
 
 from ..guardrail_engine import small_talk_kind
@@ -47,24 +42,10 @@ class NodeBase:
         self.s = services
 
 
-# Outcomes that *are* a governance decision, which §05 Stage 06 requires be written
-# synchronously. `answer` is deliberately absent: a failed audit write must fail a block, not
+# Outcomes that *are* a governance decision, which solution §02 ("Response & audit") requires
+# be written before the user is answered. `answer` is deliberately absent: a failed audit write must fail a block, not
 # a plain answer. Sign-offs keep `outcome == "answer"`; see `_is_governance_decision`.
-GOVERNANCE_OUTCOMES = frozenset({"blocked", "escalated", "expired", "review_pending"})
-
-
-def _narrates(state: dict) -> bool:
-    """Whether this turn should stream a task plan at all.
-
-    Small talk goes through no gate, so narrating stages for "hi" claims work that never
-    happened. Decided from the message, not a result, so the first event is suppressed too.
-    """
-    return not small_talk_kind(_latest_user_text(state.get("messages")))
-
-
-# Anchored, so only a message that is *entirely* an appeal counts. "appeal the
-# decision to buy" inside a real request must not silently become one.
-_APPEAL_PATTERN = re.compile(r"^\W*appeal\b[\s\S]{0,120}$", re.IGNORECASE)
+GOVERNANCE_OUTCOMES = frozenset({"blocked", "escalated", "expired"})
 
 
 def _small_talk_seen(messages, kind: str) -> int:
@@ -89,21 +70,6 @@ def _latest_user_text(messages) -> str:
         if getattr(msg, "type", "") == "human":
             return msg.content if isinstance(msg.content, str) else str(msg.content)
     return ""
-
-
-def _prior_user_text(messages) -> str:
-    """The user turn *before* the current one — on an appeal, the request that was blocked.
-
-    Falls back to the current turn so an excerpt is never empty for want of history.
-    """
-    seen = 0
-    for msg in reversed(messages or []):
-        if getattr(msg, "type", "") != "human":
-            continue
-        seen += 1
-        if seen == 2:
-            return msg.content if isinstance(msg.content, str) else str(msg.content)
-    return _latest_user_text(messages)
 
 
 def _window(messages, max_tokens: int) -> list:
@@ -201,7 +167,7 @@ _SOURCE_FIELD_MAX = 200
 
 
 def _clean_sources(sources, guard=None) -> list[dict]:
-    """Screen the worker-declared grounding a UI renders under an answer.
+    """Screen the worker-declared sources a UI renders under an answer.
 
     `title` and `origin` are rendered as sent, so unscreened they were a channel for a
     credential or directive frame. Bounded and screened once, before the stream or state.
@@ -264,7 +230,7 @@ def _session_age_seconds(state: dict) -> Optional[float]:
 
 
 def _session_idle_seconds(state: dict) -> Optional[float]:
-    """Time since the last turn — what the lifetime bound measures (§05 Stage 04).
+    """Time since the last turn — what the session lifetime bound measures.
 
     "Abandoned" is about inactivity, not total age. Conversations checkpointed before
     `session_last_active_at` existed fall back to the start time, the stricter measure.
@@ -282,24 +248,19 @@ def _is_governance_decision(state: dict) -> bool:
     return bool(state.get("outcome", "") in GOVERNANCE_OUTCOMES or state.get("signoff"))
 
 
-def _provenance(settings, spend: TurnSpend) -> dict:
-    """How this turn was decided: which model, which prompts, what it spent.
+def _provenance(settings) -> dict:
+    """How this turn was decided: which model and which prompt versions.
 
-    §4.1 promotes prompt versions by a *movable* alias, so "the dev alias" does not identify
+    Prompt versions are promoted by a *movable* alias, so "the dev alias" does not identify
     the text behind a verdict. `prompts` is process-scoped; `{}` when nothing is to report.
+    Token usage per model call is on the MLflow trace, not here.
     """
-    from ..prompt_provider import loaded_prompt_versions
+    from ..prompt_registry import loaded_prompt_versions
 
     versions = loaded_prompt_versions()
-    by_stage = spend.record()["by_stage"]
-    if not versions and not by_stage:
+    if not versions:
         return {}
-    record: dict = {"routing_model": getattr(settings, "routing_llm_endpoint", "")}
-    if versions:
-        record["prompts"] = versions
-    if by_stage:
-        record["spend_by_stage"] = by_stage
-    return record
+    return {"routing_model": getattr(settings, "routing_llm_endpoint", ""), "prompts": versions}
 
 
 def _excerpt(text: str, limit: int = 500) -> str:

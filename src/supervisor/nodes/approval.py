@@ -12,9 +12,8 @@ from typing import Literal
 from langgraph.runtime import Runtime
 from langgraph.types import Command, interrupt
 
-from ..messages import progress
 from ..state import SupervisorContext
-from .turn import (
+from .base import (
     NodeBase,
     _now_iso,
     _trail,
@@ -25,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 class ApprovalMixin(NodeBase):
     def _may_approve(self, context: SupervisorContext, agent_id: str) -> bool:
-        """May this caller sign off work produced by `agent_id`? (§2.11)
+        """May this caller sign off work produced by `agent_id`?
 
         None and () differ: () means this caller may approve nothing; None means the field was
         not supplied — only possible off the deployed path — so it defers to the access decision.
@@ -37,8 +36,8 @@ class ApprovalMixin(NodeBase):
 
         logger.warning(
             "no approvable_agents supplied — approving '%s' on the access decision alone. "
-            "The Platform API always supplies this field; seeing it here means the graph "
-            "was invoked outside the gateway.",
+            "The calling application always supplies this field; seeing it here means the "
+            "graph was invoked some other way.",
             agent_id,
         )
         permitted = context.permitted_agents
@@ -79,10 +78,10 @@ class ApprovalMixin(NodeBase):
         )
         comment = decision.get("comment", "") if isinstance(decision, dict) else ""
 
-        # ── Who approved what, and when (§05 Stage 04 callout) ───────────────
-        # §05 Stage 04: "record who approved what and when". §09 allows self-approval only
-        # *"with a recorded approver identity"* — the trail is the compensating control.
-        # `user_key` is the strongest attributable identity here; §1.10 keeps the raw subject out.
+        # ── Who approved what, and when ───────────────────────────────────────
+        # Solution §02: a staged artifact waits for explicit human approval, and the trail
+        # records who gave it. `user_key` is the strongest attributable identity here; the raw
+        # subject never reaches the supervisor.
         approver = context.user_key or "unattributed"
         decided_at = _now_iso()
         signoff = {
@@ -95,16 +94,15 @@ class ApprovalMixin(NodeBase):
         }
         if approved and approver == "unattributed":
             # Refused, not merely logged: a compensating control that records "unattributed"
-            # does not compensate (§09); the artifact stays staged for an attributable caller.
+            # does not compensate; the artifact stays staged for an attributable caller.
             # A rejection below still goes through: declining to act widens nothing.
             logger.warning(
                 "approval decision for '%s' stage '%s' carries no approver identity — "
-                "refused. The Platform API always supplies one, so the graph was "
-                "invoked outside the gateway.",
+                "refused. The calling application always supplies one, so the graph was "
+                "invoked some other way.",
                 owner_id,
                 stage,
             )
-            progress("dispatch", "blocked", "approval not attributable")
             return Command(
                 goto="respond",
                 update={
@@ -128,7 +126,6 @@ class ApprovalMixin(NodeBase):
         # An approval is bound to the agent that produced the artifact (from the checkpoint),
         # not the id the request was addressed with. Rejecting needs no permission.
         if approved and not self._may_approve(context, owner_id):
-            progress("dispatch", "blocked", "approval not permitted")
             return Command(
                 goto="respond",
                 update={
@@ -150,7 +147,6 @@ class ApprovalMixin(NodeBase):
             )
 
         if not approved:
-            progress("dispatch", "done", "rejected")
             return Command(
                 goto="respond",
                 update={
@@ -175,7 +171,6 @@ class ApprovalMixin(NodeBase):
                 },
             )
 
-        progress("dispatch", "done", "approved")
         return Command(
             goto="respond",
             update={

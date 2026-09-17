@@ -18,9 +18,9 @@ from supervisor.settings import Settings
 
 _RULES = [
     (re.compile(rule["pattern"]), rule["reason"])
-    for rule in yaml.safe_load(Settings().guardrails_config.read_text(encoding="utf-8"))[
-        "global_deny_patterns"
-    ]
+    for rule in yaml.safe_load(
+        (Settings().config_dir / "guardrails.yaml").read_text(encoding="utf-8")
+    )["global_deny_patterns"]
 ]
 
 
@@ -78,7 +78,7 @@ def test_credential_request_family():
 
 def _action(query: str) -> str:
     """The action of the first matching rule, or "" when none matches."""
-    rules = yaml.safe_load(Settings().guardrails_config.read_text(encoding="utf-8"))[
+    rules = yaml.safe_load((Settings().config_dir / "guardrails.yaml").read_text(encoding="utf-8"))[
         "global_deny_patterns"
     ]
     for rule in rules:

@@ -7,12 +7,8 @@ table and a table anyone can rewrite.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
-import json
-
 import pytest
-from agent_governance import rbac, trust
+from agent_governance import rbac
 from agent_governance.rbac import RbacPolicy
 
 
@@ -46,7 +42,6 @@ def test_missing_role_or_agent_is_denied():
 TABLES = {
     "config": "supervisor_config",
     "audit": "supervisor_audit_log",
-    "reviews": "supervisor_review_queue",
 }
 
 # The posture DEPLOYMENT.md §7b's REVOKEs produce.
@@ -54,9 +49,6 @@ RESTRICTED = [
     ("supervisor_config", "SELECT"),
     ("supervisor_audit_log", "INSERT"),
     ("supervisor_audit_log", "SELECT"),
-    ("supervisor_review_queue", "INSERT"),
-    ("supervisor_review_queue", "SELECT"),
-    ("supervisor_review_queue", "UPDATE"),
 ]
 
 # What the runtime holds before anyone runs them — it created the tables.
@@ -138,12 +130,6 @@ def test_trigger_alone_is_reported():
     assert [f.excess for f in findings] == [("TRIGGER",)]
 
 
-def test_the_review_queue_keeps_update_but_not_delete():
-    grants = RESTRICTED + [("supervisor_review_queue", "DELETE")]
-    findings = rbac.check_privileges(source(grants), TABLES)
-    assert [f.excess for f in findings] == [("DELETE",)]
-
-
 def test_config_may_only_be_read():
     grants = RESTRICTED + [("supervisor_config", "UPDATE")]
     findings = rbac.check_privileges(source(grants), TABLES)
@@ -196,92 +182,3 @@ def test_every_declared_role_forbids_delete_and_trigger(role_key):
     allowed = rbac.ALLOWED[role_key]
     assert "DELETE" not in allowed
     assert "TRIGGER" not in allowed
-
-
-# ── The entitlement HMAC — what makes a caller-supplied permitted set safe ──
-#
-# The Governance Front Door keeps its own copy of the signer, so the exact bytes signed
-# are a wire contract — compact sorted JSON of `trust.SIGNED_FIELDS`, HMAC-SHA256, hex.
-# A change here would break a live deployment mid-rollout.
-
-SECRET = "0123456789abcdef0123456789abcdef"
-
-
-def _block() -> dict:
-    return {
-        "user_role": "BA",
-        "agent_id": "requirement-agent",
-        "permitted_agents": ["requirement-agent", "coding-agent"],
-        "approvable_agents": [],
-        "user_id": "usr_ab12",
-        "correlation_id": "corr-1",
-        "environment": "dev",
-    }
-
-
-def test_entitlement_signature_is_hmac_over_compact_sorted_json_of_signed_fields():
-    block = _block()
-    payload = {k: block[k] for k in trust.SIGNED_FIELDS if k in block}
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    expected = hmac.new(SECRET.encode(), canonical.encode(), hashlib.sha256).hexdigest()
-    assert trust.sign_entitlements(block, SECRET) == expected
-
-
-def test_a_signed_block_verifies_and_a_tampered_one_does_not():
-    block = _block()
-    block[trust.SIGNATURE_FIELD] = trust.sign_entitlements(block, SECRET)
-    assert trust.verify_entitlements(block, SECRET) is True
-
-    field = trust.SIGNED_FIELDS[0]
-    tampered = {**block, field: "something-else"}
-    assert trust.verify_entitlements(tampered, SECRET) is False
-
-
-def test_an_unsigned_block_is_refused_only_when_a_secret_is_configured():
-    block = _block()
-    # Secret configured: unsigned means it did not come through the gateway.
-    assert trust.verify_entitlements(block, SECRET) is False
-    # Control dark: nothing is checked and every block passes.
-    assert trust.verify_entitlements(block, "") is True
-
-
-def test_signing_with_an_empty_secret_is_an_error_not_a_weak_signature():
-    with pytest.raises(ValueError):
-        trust.sign_entitlements(_block(), "")
-    with pytest.raises(ValueError):
-        trust.sign_dispatch(_block(), "")
-
-
-def test_the_secret_is_read_from_the_environment_per_call(monkeypatch):
-    monkeypatch.delenv("SUPERVISOR_TRUST_SECRET", raising=False)
-    assert trust.trust_secret() == ""
-    monkeypatch.setenv("SUPERVISOR_TRUST_SECRET", SECRET)
-    assert trust.trust_secret() == SECRET
-
-
-def test_dispatch_signature_round_trips_and_a_replayed_nonce_change_is_caught():
-    dispatch = {
-        "conversation_id": "thr-1",
-        "agent_id": "coding-agent",
-        "request_id": "req-1",
-        "correlation_id": "corr-1",
-        "pseudonymous_user_reference": "usr_ab12",
-        "nonce": trust.new_nonce(),
-    }
-    dispatch[trust.DISPATCH_SIGNATURE_FIELD] = trust.sign_dispatch(dispatch, SECRET)
-    assert trust.verify_dispatch(dispatch, SECRET) is True
-    assert trust.verify_dispatch({**dispatch, "nonce": trust.new_nonce()}, SECRET) is False
-    assert (
-        trust.verify_dispatch(
-            {k: v for k, v in dispatch.items() if k != trust.DISPATCH_SIGNATURE_FIELD}, SECRET
-        )
-        is False
-    )
-    # Ships dark, like the entitlement check.
-    assert trust.verify_dispatch({"agent_id": "x"}, "") is True
-
-
-def test_nonces_are_32_hex_chars_and_never_repeat():
-    nonces = {trust.new_nonce() for _ in range(64)}
-    assert len(nonces) == 64
-    assert all(len(n) == 32 and int(n, 16) >= 0 for n in nonces)

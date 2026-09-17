@@ -10,15 +10,13 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
 
-from agent_governance import audit, rbac
-from agent_governance.config_store import Reloading
+from agent_governance import audit_trail, rbac
+from agent_governance.governed_config_store import Reloading
 from agent_governance.output_guard import OutputGuard
-from agent_governance.review_queue import NullReviewQueue, ReviewQueue
-from agent_governance.spend import SubjectWindow, build_spend_window
 
-from .config import SupervisorConfig
+from .context_resolver import ContextResolver
+from .governed_config import SupervisorConfig
 from .memory import LongTermMemory, audit_connection_source, build_store
-from .routing import Router
 from .settings import Settings
 from .worker_client import (
     CircuitBreaker,
@@ -37,8 +35,8 @@ logger = logging.getLogger(__name__)
 # resolving every attribute at call time, which no structural type can describe.
 
 
-class ContextResolver(Protocol):
-    """The route stage's collaborator (`routing.Router`)."""
+class ResolvesContext(Protocol):
+    """The route stage's collaborator (`context_resolver.ContextResolver`)."""
 
     def resolve(
         self,
@@ -51,26 +49,13 @@ class ContextResolver(Protocol):
 
 
 class AuditSink(Protocol):
-    """Where a turn's decision record lands (`agent_governance.audit`)."""
+    """Where a turn's decision record lands (`agent_governance.audit_trail`)."""
 
     def log(self, record: dict) -> None: ...
 
 
-class ReviewSink(Protocol):
-    """The appeal / escalation queue (§05 Stage 03, Stage 04).
-
-    Structural on purpose: `NullReviewQueue` is not a subclass of the concrete `ReviewQueue`.
-    """
-
-    def open_review(self, **kwargs) -> Any: ...
-
-    def claim_allowance(self, conversation_id: str) -> Any: ...
-
-    def get(self, ref: str) -> Any: ...
-
-
 class ResponseGuard(Protocol):
-    """Layer 7. Four surfaces, one policy — see the field comment below."""
+    """Layer 7. Three surfaces, one policy — see the field comment below."""
 
     def screen(self, text: str) -> Any: ...
 
@@ -78,48 +63,30 @@ class ResponseGuard(Protocol):
 
     def scrub(self, text: str, fallback: str = "") -> str: ...
 
-    def stream_should_hold(self, buffer: str) -> bool: ...
-
-    def stream_findings(self, buffer: str) -> tuple: ...
-
-
-class SpendWindow(Protocol):
-    """One subject's rolling governance-spend allowance (`spend.py`)."""
-
-    def check(self, subject: str) -> str: ...
-
-    def charge(self, subject: str, *, model_calls: int = 0, tokens: int = 0) -> None: ...
-
 
 @dataclass
 class Services:
     settings: Settings
-    # In production these three are `config_store.Reloading` proxies over the governed table,
+    # In production these three are `governed_config_store.Reloading` proxies over the governed table,
     # so a published change reaches a running endpoint without a redeploy.
     registry: Any  # AgentRegistry, behind a Reloading proxy
     rbac: Any  # RbacPolicy, behind a Reloading proxy
     # The graph calls .screen(query, candidates, history=None) -> ScreenResult;
     # .evaluate(query, agent, history=None) is the single-agent form for direct callers.
     guardrails: Any  # GuardrailEngine, behind a Reloading proxy
-    router: ContextResolver
+    router: ResolvesContext
     workers: WorkerClient
     audit: AuditSink
     memory: LongTermMemory
-    # Appeal / escalation queue (§05 Stage 03, 04). The `NullReviewQueue` default raises on
-    # every write on purpose: an appeal that cannot be recorded must not be reported as flagged.
-    reviews: ReviewSink = field(default_factory=lambda: NullReviewQueue())
-    # Layer-7 screen (output_guard.py). Four surfaces, one policy: `.screen()` for a worker
-    # reply, `.relay()` for the conversation bound *to* a worker, `.scrub()` for model-written
-    # governance text, and `stream_*` for live tokens. A test stand-in must provide all four.
+    # Layer-7 screen (output_guard.py). Three surfaces, one policy: `.screen()` for a worker
+    # reply, `.relay()` for the conversation bound *to* a worker, and `.scrub()` for
+    # model-written governance text. A test stand-in must provide all three.
     output_guard: ResponseGuard = field(default_factory=OutputGuard)
-    # One subject's rolling governance-spend allowance (spend.py). Process-wide rather than
-    # per-turn, which is why it lives beside the other long-lived collaborators.
-    spend_window: SpendWindow = field(default_factory=SubjectWindow)
 
 
 def build_audit_logger(settings: Settings):
     """The decision-trail sink over the same Postgres the checkpointer uses."""
-    return audit.build_audit_logger(audit_connection_source(), settings.audit_pg_table)
+    return audit_trail.build_audit_logger(audit_connection_source(), settings.audit_pg_table)
 
 
 def _report_privileges(settings: Settings) -> None:
@@ -133,28 +100,9 @@ def _report_privileges(settings: Settings) -> None:
             {
                 "config": settings.config_table,
                 "audit": settings.audit_pg_table,
-                "reviews": settings.review_queue_table,
             },
         )
     )
-
-
-def build_review_queue(settings: Settings):
-    """The appeal queue in the same Postgres as the audit sink, or a null one.
-
-    Same database on purpose: an appeal is a governance record, and a reviewer should not
-    query one store for the decision and another for the appeal against it.
-    """
-    source = audit_connection_source()
-    if source is None:
-        logger.warning(
-            "review queue: none configured — appeals and escalations cannot be "
-            "recorded as queryable state, so Stage 03's appeal path is not met. "
-            "Configure Lakebase (LAKEBASE_INSTANCE)."
-        )
-        return NullReviewQueue()
-    logger.info("review queue: Postgres table %s", settings.review_queue_table)
-    return ReviewQueue(source, settings.review_queue_table)
 
 
 def build_services(settings: Settings | None = None) -> Services:
@@ -163,9 +111,9 @@ def build_services(settings: Settings | None = None) -> Services:
     # refuses to build rather than serve without it. See Settings.enforce.
     settings.enforce()
 
-    # §4.1: model access is isolated in model_provider; no node or tool names a
-    # model endpoint directly.
-    from .model_provider import get_agent_model, get_routing_model
+    # Model access is isolated in llm_provider; no node or tool names a model
+    # endpoint directly (solution §06: the model is configuration).
+    from .llm_provider import get_agent_model, get_routing_model
 
     llm = get_routing_model(settings)
 
@@ -175,7 +123,7 @@ def build_services(settings: Settings | None = None) -> Services:
         return get_agent_model(settings, agent)
 
     workers = (
-        SimulatedWorkerClient(llm, max_tokens=settings.worker_max_tokens, model_for=model_for)
+        SimulatedWorkerClient(llm, model_for=model_for)
         if settings.mock_workers
         else ModelServingWorkerClient(
             max_attempts=settings.worker_max_attempts,
@@ -210,7 +158,7 @@ def build_services(settings: Settings | None = None) -> Services:
                 contested_margin=settings.routing_contested_margin,
             )
         ),
-        router=Router(llm, model_for=model_for),
+        router=ContextResolver(llm, model_for=model_for),
         workers=workers,
         # Built after the store, so both share one Postgres connection.
         audit=build_audit_logger(settings),
@@ -222,11 +170,7 @@ def build_services(settings: Settings | None = None) -> Services:
             allowed_keys=lambda: config.registry().context_keys(),
             ttl_seconds=settings.long_term_memory_ttl_seconds,
         ),
-        reviews=build_review_queue(settings),
         # Same governed guardrails document and Reloading proxy as the input engine, so
         # publishing an output rule needs no redeploy either.
         output_guard=Reloading(lambda: config.output_guard(mask_pii=settings.output_pii_masking)),
-        # Built once per process: the window it keeps *is* the cross-turn state. Not `Reloading`
-        # — rebuilding on a publish would hand an exhausted subject a fresh allowance.
-        spend_window=build_spend_window(settings),
     )

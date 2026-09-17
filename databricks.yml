@@ -10,7 +10,7 @@
 #   resources/deploy_job.yml  the job that registers, publishes and deploys
 #   resources/lakebase.yml    shared infrastructure — disabled, see the file
 #
-# What the bundle does NOT own: the serving endpoint. log_and_deploy.py creates
+# What the bundle does NOT own: the serving endpoint. deploy_agent.py creates
 # it imperatively — `databricks.agents.deploy()` by default, or the Model
 # Serving SDK when `deploy_method: serving-api` — right after registering the
 # model version it must serve. A declarative `model_serving_endpoints` resource
@@ -97,7 +97,7 @@ variables:
   lakebase_instance:
     description: >-
       Lakebase database instance backing durable conversation memory, long-term
-      memory, the governed config table, the review queue and the Postgres audit
+      memory, the governed config table and the Postgres audit
       sink. Create it first (DEPLOYMENT.md §5, or enable resources/lakebase.yml);
       declaring one that does not exist fails the model registration. One
       instance serves every environment — they are separated by lakebase_schema.
@@ -111,7 +111,7 @@ variables:
     default: supervisor_${bundle.target}
   deploy_method:
     description: >-
-      How log_and_deploy.py creates the endpoint. 'agents' calls
+      How deploy_agent.py creates the endpoint. 'agents' calls
       databricks.agents.deploy(); 'serving-api' uses the Model Serving SDK
       directly — same endpoint name, same tracing setup, no Review App entry.
       Switch to 'serving-api' in a workspace where agents.deploy() fails
@@ -131,7 +131,7 @@ variables:
 #
 # Built locally by `bundle deploy`, uploaded with the bundle, installed into the
 # job environment (so the log-time validation prediction can import it) and,
-# by log_and_deploy.py, baked into the model artifact under wheels/ so the
+# by deploy_agent.py, baked into the model artifact under wheels/ so the
 # serving container installs the exact copy that was tested.
 artifacts:
   agent_governance:
@@ -143,7 +143,7 @@ artifacts:
 
 # What the job needs, named explicitly so it is uploaded even where a
 # .gitignore rule would exclude it. `include` ADDS to the sync set. The built
-# wheel is gitignored and is included here on purpose: log_and_deploy.py reads
+# wheel is gitignored and is included here on purpose: deploy_agent.py reads
 # the file to bake it into the model artifact.
 sync:
   include:

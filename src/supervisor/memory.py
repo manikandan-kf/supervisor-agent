@@ -46,18 +46,13 @@ def audit_connection_source():
     return lakebase.audit_connection_source(schema=_lakebase_schema())
 
 
-def lock_connection_source():
-    """Connection source for the per-thread execution lock, or None. See locking.py."""
-    return lakebase.lock_connection_source(schema=_lakebase_schema())
-
-
 # Long-term memory is an *instruction* channel: everything in it is read back into the
 # routing prompt. So values must be identifiers under allowlisted keys, and four bounds apply
 # because any one alone is porous — charset, length, word count, and an imperative opener.
 _VALUE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 \-_./+&]{0,59}$")
 _MAX_VALUE_LENGTH = 60
-# Room for the longest plausible real label ("Honeywell Building Management
-# Systems"), and nothing like enough for an instruction.
+# Room for the longest plausible real label ("Building Management Systems
+# Platform"), and nothing like enough for an instruction.
 _MAX_VALUE_WORDS = 4
 # First word only: "Route 66 Migration" is a plausible label, but nothing legitimate *leads*
 # with "ignore". A rejected genuine label shows in the trail's `refused` entry.

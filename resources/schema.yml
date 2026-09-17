@@ -2,7 +2,7 @@
 # the governed configuration and the MLflow trace tables all land here.
 #
 # It must exist before the job runs, and `bundle deploy` creates it — so the
-# `register_prompts` and `log_and_deploy` tasks can address
+# `register_prompts` and `deploy_agent` tasks can address
 # ${var.catalog}.${var.schema} without a pre-flight step.
 #
 # Deploying into a schema that already exists and is owned by someone else:

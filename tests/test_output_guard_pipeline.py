@@ -12,7 +12,7 @@ from __future__ import annotations
 from agent_governance.output_guard import OutputGuard
 from helpers import FAKE_DATABRICKS_TOKEN, StubAudit, StubWorkers, invoke
 
-from supervisor.messages import OUTPUT_WITHHELD_MESSAGE
+from supervisor.user_facing_text import OUTPUT_WITHHELD_MESSAGE
 from supervisor.worker_client import WorkerResponse
 
 
@@ -75,17 +75,16 @@ def test_a_policy_match_blocks_delivery_without_leaking_the_rule(make_graph):
     assert "release-block marker" in entry["detail"]
 
 
-def test_a_withheld_response_offers_the_appeal_path(make_graph):
-    """§06: a block offers a way forward that is not retrying the same text."""
+def test_a_withheld_response_is_final(make_graph):
+    """A block-tier output finding withholds the reply and ends there: no appeal path,
+    the event in the trail for whoever reads it."""
     guard = OutputGuard([{"pattern": "forbidden", "reason": "policy"}])
     workers = StubWorkers([WorkerResponse(text="forbidden content")])
-    reviews_graph, services = make_graph(workers=workers, output_guard=guard)
-    invoke(reviews_graph, "write an HLD for billing on alpha")
+    graph, _ = make_graph(workers=workers, output_guard=guard)
+    result = invoke(graph, "write an HLD for billing on alpha")
 
-    appealed = invoke(reviews_graph, "appeal")
-    assert appealed["outcome"] == "escalated"
-    assert services.reviews.opened, "the appeal must land in the review queue"
-    assert "policy" in services.reviews.opened[0].reason
+    assert result["outcome"] == "blocked"
+    assert result["final_text"] == OUTPUT_WITHHELD_MESSAGE
 
 
 def test_a_staged_artifact_goes_through_the_same_screen(make_graph):

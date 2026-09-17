@@ -23,7 +23,7 @@ class WorkerAgent:
     required_context: tuple[str, ...] = ()
     deny_patterns: tuple[str, ...] = ()
     # Endpoint for this agent's *governance* calls when MULTI_MODEL_ENABLED; empty
-    # means the global routing LLM. Not the worker's own model (ASM-03).
+    # means the routing LLM. Never the worker's own model: that is the worker's business.
     model: str = ""
     # ── Supervisor-enforced human approval ──────────────────────────────────
     # Solution §04: irreversible actions sit behind the approval gate regardless of
@@ -75,7 +75,7 @@ class AgentRegistry:
         """Why this request to `agent` needs human sign-off, or "" if it does not.
 
         A match is a *requirement*: the response is staged regardless of the worker's
-        reply. Compiled per call — `re` caches, and `config_store` validated at publish.
+        reply. Compiled per call — `re` caches, and `governed_config_store` validated at publish.
         """
         if agent is None or not query:
             return ""

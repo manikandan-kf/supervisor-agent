@@ -1,17 +1,16 @@
 # Persona -> agent mapping, keyed by identity-provider GROUP name.
 #
-# FALLBACK ONLY. The identity provider is the single source of truth
-# (framework §2.5, §2.9).
-# The Platform API derives the caller's permitted agents from the Platform API
-# client roles in their token and passes that set to the supervisor as
-# `permitted_agents`; the RBAC gate uses it, and this file is not consulted.
+# FALLBACK ONLY. The calling application is the single source of truth: it
+# derives the caller's permitted agents from the caller's roles and passes that
+# set to the supervisor as `permitted_agents` in custom_inputs; the RBAC gate
+# uses it, and this file is not consulted.
 #
 # It is still read when `permitted_agents` is absent — a caller that predates
 # the field, or a direct endpoint invocation during development. That is the
 # only path where a stale entry here could matter, so keep it in step with the
 # identity-provider groups it mirrors.
 #
-# What enforces BR-002 "at the data level" is the RBAC gate revalidating the
+# What enforces access at the data level is the RBAC gate revalidating the
 # invocation path's agent-id against the permitted set on every call, not this
 # file.
 roles:

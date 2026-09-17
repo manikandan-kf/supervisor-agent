@@ -13,7 +13,6 @@ from agent_governance.environment import (  # noqa: F401 — re-exported for the
     resource_environment,
 )
 from agent_governance.environment import environment_schema as _environment_schema
-from agent_governance.trust import trust_secret
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +32,7 @@ def environment_schema(environment: str | None = None) -> str:
 
 @dataclass(frozen=True)
 class Settings:
-    # Client-selected from the approved model list (ASM-04); wired via DAB target vars.
+    # From the approved model list (solution §06); wired via DAB target vars.
     routing_llm_endpoint: str = field(
         default_factory=lambda: os.getenv("ROUTING_LLM_ENDPOINT", "databricks-claude-sonnet-4-5")
     )
@@ -53,7 +52,7 @@ class Settings:
     routing_llm_timeout_seconds: float = field(
         default_factory=lambda: float(os.getenv("ROUTING_LLM_TIMEOUT_SECONDS", "30"))
     )
-    # **Zero on purpose**: `resilience.invoke_with_retries` is the one retry authority.
+    # **Zero on purpose**: `retry_and_deadline.invoke_with_retries` is the one retry authority.
     routing_llm_max_retries: int = field(
         default_factory=lambda: int(os.getenv("ROUTING_LLM_MAX_RETRIES", "0"))
     )
@@ -67,39 +66,19 @@ class Settings:
     )
     # ── The turn's total time budget ────────────────────────────────────────
     # Per-call bounds don't compose across the fan-out. Guarantee: budget + longest
-    # call = 120 + 45 = 165s < 180s gateway. **Re-check the sum if either bound moves.**
+    # call = 120 + 45 = 165s, under a 180s caller timeout. **Re-check the sum if either bound moves.**
     turn_budget_seconds: float = field(
         default_factory=lambda: float(os.getenv("TURN_BUDGET_SECONDS", "120"))
     )
-    # ── The turn's spend envelope (cost control) ────────────────────────────
-    # Spend ceiling (spend.py), supervisor's own calls only. **Zero disables each
-    # cap independently.** 8 = screen (one per candidate, 4) + route, with headroom.
-    turn_max_model_calls: int = field(
-        default_factory=lambda: int(os.getenv("TURN_MAX_MODEL_CALLS", "8"))
-    )
-    # ~6k tokens x 8 calls; an estimate, so the call ceiling is the primary control.
-    turn_max_tokens: int = field(default_factory=lambda: int(os.getenv("TURN_MAX_TOKENS", "60000")))
-    # Per-subject rolling allowance, per replica (spend.py). Off by default: it
-    # wants a value from observed spend, and refusing real users is worse than none.
-    subject_max_model_calls: int = field(
-        default_factory=lambda: int(os.getenv("SUBJECT_MAX_MODEL_CALLS", "0"))
-    )
-    subject_max_tokens: int = field(
-        default_factory=lambda: int(os.getenv("SUBJECT_MAX_TOKENS", "0"))
-    )
-    subject_spend_window_seconds: float = field(
-        default_factory=lambda: float(os.getenv("SUBJECT_SPEND_WINDOW_SECONDS", "3600"))
-    )
-
-    # Mirrored from the platform (§2.2); selects the promoted prompt alias.
+    # Which deployment this is (dev / prod); selects the promoted prompt alias.
     environment: str = field(default_factory=lambda: os.getenv("ENVIRONMENT", "local"))
     config_dir: Path = field(
         default_factory=lambda: Path(os.getenv("SUPERVISOR_CONFIG_DIR", str(_PACKAGE_CONFIG)))
     )
 
     # ── Governance configuration source ─────────────────────────────────────
-    # R1 wants config in governed tables; the SP cannot hold `databricks-sql-access`,
-    # so the table is the Lakebase one (config_store.py). auto = table if Postgres
+    # Solution §02 puts configuration in governed tables; the SP cannot hold
+    # `databricks-sql-access`, so the table is the Lakebase one (governed_config_store.py). auto = table if Postgres
     # is configured else bundled YAML; table = require it; files = bundled YAML only.
     config_source: str = field(
         default_factory=lambda: os.getenv("SUPERVISOR_CONFIG_SOURCE", "auto").strip().lower()
@@ -110,19 +89,6 @@ class Settings:
     # 60s matches MLflow's prompt-alias cache so the two governed things move together.
     config_cache_seconds: float = field(
         default_factory=lambda: float(os.getenv("CONFIG_CACHE_TTL_SECONDS", "60"))
-    )
-
-    # ── Thread execution serialization (§4.4) ───────────────────────────────
-    # §4.4 "only one execution updates a thread at a time"; Model Serving has no affinity.
-    thread_lock_enabled: bool = field(
-        default_factory=lambda: os.getenv("THREAD_LOCK_ENABLED", "true").lower() != "false"
-    )
-    # Absorbs a normal turn queued ahead (P95 ~8s); past this the turn is refused.
-    thread_lock_timeout_seconds: float = field(
-        default_factory=lambda: float(os.getenv("THREAD_LOCK_TIMEOUT_SECONDS", "15"))
-    )
-    thread_lock_poll_seconds: float = field(
-        default_factory=lambda: float(os.getenv("THREAD_LOCK_POLL_SECONDS", "0.25"))
     )
 
     # ── Audit sink ──────────────────────────────────────────────────────────
@@ -137,23 +103,7 @@ class Settings:
         default_factory=lambda: int(os.getenv("MAX_CLARIFICATIONS", "2"))
     )
 
-    # ── Session notes (short-term memory) ───────────────────────────────────
-    # "Keep this in mind" notes held for the conversation (session_notes.py). Bounded
-    # because the text is replayed into a later prompt. **Zero disables the feature.**
-    session_notes_max: int = field(
-        default_factory=lambda: int(os.getenv("SESSION_NOTES_MAX", "20"))
-    )
-    session_note_max_chars: int = field(
-        default_factory=lambda: int(os.getenv("SESSION_NOTE_MAX_CHARS", "500"))
-    )
-
-    # ── Appeal / escalation review queue (§05 Stage 03, Stage 04) ───────────
-    # Queryable review state (review_queue.py): a log entry nothing reads back is not a control.
-    review_queue_table: str = field(
-        default_factory=lambda: os.getenv("REVIEW_QUEUE_TABLE", "supervisor_review_queue")
-    )
-
-    # ── Session lifetime (§05 Stage 04) ─────────────────────────────────────
+    # ── Session lifetime ────────────────────────────────────────────────────
     # GDPR Art. 5(1)(e), SOC 2 CC6.1: measured from the last turn, not the first;
     # evaluated lazily on the next turn, so no sweeper is needed.
     session_max_age_seconds: float = field(
@@ -174,8 +124,8 @@ class Settings:
     )
 
     # ── Inbound message bounds (guardrail layer 1, defence in depth) ────────
-    # Twin of the gateway's 8000-char cap, which protects only callers who came
-    # through it. Keep >= the gateway's cap.
+    # Twin of the calling application's payload size check (solution §05), which
+    # protects only callers who came through it. Keep >= that cap.
     input_max_chars: int = field(default_factory=lambda: int(os.getenv("INPUT_MAX_CHARS", "8000")))
 
     # ── Guardrail-block anomaly threshold (guardrail layer 6) ───────────────
@@ -190,23 +140,8 @@ class Settings:
     output_pii_masking: bool = field(
         default_factory=lambda: os.getenv("OUTPUT_PII_MASKING", "true").lower() != "false"
     )
-    # Live relay runs through `output_guard.StreamGuard`; off closes the residual
-    # entirely and the closing item carries the whole guarded answer.
-    output_stream_worker_tokens: bool = field(
-        default_factory=lambda: os.getenv("OUTPUT_STREAM_WORKER_TOKENS", "true").lower() != "false"
-    )
-    # Longer than any contiguous credential shape, shorter than a sentence. Zero
-    # lets a value split across tokens escape — `validate()` flags it when deployed.
-    output_stream_holdback_chars: int = field(
-        default_factory=lambda: int(os.getenv("OUTPUT_STREAM_HOLDBACK_CHARS", "160"))
-    )
-    # Grounding footnote for unevidenced claims (grounding.py); never a rewrite.
-    output_provenance_notes: bool = field(
-        default_factory=lambda: os.getenv("OUTPUT_PROVENANCE_NOTES", "true").lower() != "false"
-    )
-
-    # ── Worker output handling (§05 Stage 06) ───────────────────────────────
-    # "Treat worker output as untrusted — bound its size." 24000 chars (~6000
+    # ── Worker output handling ──────────────────────────────────────────────
+    # Worker output is untrusted, so its size is bounded. 24000 chars (~6000
     # tokens) is more than one artifact and a ceiling on a worker that loops.
     worker_output_max_chars: int = field(
         default_factory=lambda: int(os.getenv("WORKER_OUTPUT_MAX_CHARS", "24000"))
@@ -255,13 +190,6 @@ class Settings:
         default_factory=lambda: float(os.getenv("WORKER_CIRCUIT_COOLDOWN_SECONDS", "60"))
     )
 
-    # ── Worker output budget ────────────────────────────────────────────────
-    # The prompt's length rule is advisory; this bounds spend when shaping fails.
-    # 1024 tokens ~ 750 words.
-    worker_max_tokens: int = field(
-        default_factory=lambda: int(os.getenv("WORKER_MAX_TOKENS", "1024"))
-    )
-
     # ── Graph step ceiling ──────────────────────────────────────────────────
     # LangGraph's default 10007 is no bound for a six-node acyclic graph. 12 is
     # double the real path: an accidental cycle stops here, not in an incident.
@@ -281,10 +209,8 @@ class Settings:
         run logs each finding at ERROR. None should be reachable by typo when deployed.
         """
         findings: list[str] = []
-        if not self.thread_lock_enabled:
-            findings.append("THREAD_LOCK_ENABLED=false disables execution serialization (§4.4)")
         if self.turn_budget_seconds <= 0:
-            findings.append("TURN_BUDGET_SECONDS<=0 disables the turn time budget (§05 Stage 05)")
+            findings.append("TURN_BUDGET_SECONDS<=0 disables the turn time budget (solution §05)")
         if self.max_clarifications < 1:
             findings.append("MAX_CLARIFICATIONS<1 escalates on the first ambiguous turn")
         if not (0.0 <= self.routing_contested_margin <= 1.0):
@@ -318,11 +244,6 @@ class Settings:
             findings.append("WORKER_OUTPUT_MAX_CHARS<=0 removes the worker output size bound")
         if self.input_max_chars <= 0:
             findings.append("INPUT_MAX_CHARS<=0 removes the inbound message size bound")
-        if self.output_stream_worker_tokens and self.output_stream_holdback_chars < 40:
-            findings.append(
-                "OUTPUT_STREAM_HOLDBACK_CHARS below 40 lets a sensitive value split across "
-                "streamed tokens reach the client before the output guard sees it whole"
-            )
         if self.guardrail_block_streak_limit < 1:
             findings.append(
                 "GUARDRAIL_BLOCK_STREAK_LIMIT<1 disables the repeated-block escalation "
@@ -332,40 +253,12 @@ class Settings:
             findings.append("a per-call timeout <= 0 leaves an outbound call unbounded")
         if self.worker_max_attempts < 1 or self.governance_llm_attempts < 1:
             findings.append("retry attempt counts below 1 make every call fail before it starts")
-        if self.turn_max_model_calls <= 0 and self.turn_max_tokens <= 0:
-            findings.append(
-                "TURN_MAX_MODEL_CALLS and TURN_MAX_TOKENS are both <=0, so a turn has no "
-                "spend ceiling — only a time bound (see spend.py)"
-            )
-        elif 0 < self.turn_max_model_calls < 2:
-            # One call is not a working configuration: an ordinary turn spends
-            # a screen verdict *and* a context resolution.
-            findings.append(
-                "TURN_MAX_MODEL_CALLS=1 refuses context resolution on every turn that "
-                "passes the screen — a normal turn needs at least 2"
-            )
         if self.graph_recursion_limit < 6:
             # Six is the graph's longest legitimate path; below it an ordinary
             # approval turn fails as a recursion error.
             findings.append(
                 "GRAPH_RECURSION_LIMIT below 6 is shorter than the graph's longest "
                 "legitimate path and will fail normal turns"
-            )
-        if (
-            self.subject_max_model_calls > 0 or self.subject_max_tokens > 0
-        ) and self.subject_spend_window_seconds <= 0:
-            findings.append(
-                "a subject spend cap is set with SUBJECT_SPEND_WINDOW_SECONDS<=0, which "
-                "disables the window and therefore the cap"
-            )
-        # ── The entitlement signature (§2.7) ────────────────────────────────
-        # Without the shared secret nothing is checked, `context.verified` stays
-        # True, and any CAN QUERY principal can name its own permitted set.
-        if not trust_secret():
-            findings.append(
-                "SUPERVISOR_TRUST_SECRET is unset, so entitlement signatures cannot be "
-                "verified and a caller's own permitted_agents set is taken at face value "
-                "(§2.7 — see DEPLOYMENT.md §7e)"
             )
         return findings
 
@@ -380,8 +273,3 @@ class Settings:
             )
         for finding in findings:
             logger.error("settings: %s (tolerated only outside deployed environments)", finding)
-
-    @property
-    def guardrails_config(self) -> Path:
-        """The bundled guardrails seed — what the tier-1 pattern tests read."""
-        return self.config_dir / "guardrails.yaml"

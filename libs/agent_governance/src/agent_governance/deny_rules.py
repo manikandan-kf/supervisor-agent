@@ -32,7 +32,7 @@ def compile_rules(
 ) -> tuple[DenyRule, ...]:
     """Compile a governed rule list once, at construction.
 
-    A pattern that does not compile raises here. `config_store` refuses such a
+    A pattern that does not compile raises here. `governed_config_store` refuses such a
     document at publish time, so on the deployed path this never fires; a
     hand-built engine in a test gets the error at the point it made the mistake.
     """

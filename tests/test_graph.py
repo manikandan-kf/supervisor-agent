@@ -2,15 +2,13 @@
 
 from datetime import datetime, timedelta, timezone
 
-from agent_governance import review_queue as rq
 from agent_governance.rbac import DENIED_MESSAGE
 from helpers import StubGuardrails, StubRouter, StubWorkers, invoke, resume
-from helpers import StubReviews as _Reviews
 
-from supervisor import messages as msg
+from supervisor import user_facing_text as msg
+from supervisor.context_resolver import RouteResult
 from supervisor.guardrail_engine import GuardrailResult
-from supervisor.messages import ESCALATION_MESSAGE
-from supervisor.routing import RouteResult
+from supervisor.user_facing_text import ESCALATION_MESSAGE
 from supervisor.worker_client import WorkerResponse
 
 
@@ -373,8 +371,8 @@ def test_rejecting_needs_no_approve_permission(make_graph):
 
 
 def test_worker_call_carries_the_correlation_set(make_graph):
-    """§1.10 — every request carries the correlation fields. Without them the worker's own
-    MLflow traces are orphans and an answer cannot be traced from the calling UI onward."""
+    """Every worker request carries the correlation fields. Without them the worker's own
+    MLflow traces are orphans and an answer cannot be traced from the caller onward."""
     graph, services = make_graph()
     invoke(graph, "Write an HLD", thread="conv-8")
 
@@ -382,7 +380,7 @@ def test_worker_call_carries_the_correlation_set(make_graph):
     assert trace["agent_id"] == "requirement-agent"
     assert trace["request_id"]
     assert trace["pseudonymous_user_reference"] == "user-1"
-    # §1.10 — no raw subject, email or token may reach a worker or a prompt.
+    # No raw subject, email or token may reach a worker or a prompt.
     assert "authorization" not in {k.lower() for k in trace}
 
 
@@ -403,7 +401,7 @@ def test_worker_exception_is_contained(make_graph):
     assert services.audit.records[0]["decision_trail"][-1]["decision"] == "error"
 
 
-# ── Session lifetime (§05 Stage 04) ──────────────────────────────────────────
+# ── Session lifetime ─────────────────────────────────────────────────────────
 #
 # The RBAC gate's expiry check. State is seeded through `update_state` after one real
 # turn, so the second turn meets the checkpoint an abandoned conversation would have.
@@ -455,8 +453,6 @@ def test_an_idle_conversation_with_nothing_carried_just_restarts_its_clock(make_
             "session_context": {},
             "pending_clarification": None,
             "pending_approval": None,
-            "open_review": None,
-            "session_notes": [],
             "deferred_request": None,
         },
         as_node="respond",
@@ -482,74 +478,22 @@ def test_a_conversation_touched_recently_is_not_expired_however_old_it_is(make_g
     assert result["outcome"] != "expired"
 
 
-# ── Terminal review state (§05 Stage 03/04) ──────────────────────────────────
+# ── Escalation is a recorded decision, not a hold ────────────────────────────
 
 
-def _seed_open_review(graph, services, kind):
-    invoke(graph, "Write user stories for the login feature on product line alpha")
-    review = services.reviews.open_review(kind=kind, conversation_id="t1", reason="test")
-    graph.update_state(
-        _config(), {"open_review": {"ref": review.ref, "kind": kind}}, as_node="respond"
-    )
-    return review
+def test_an_escalation_is_audited_synchronously_and_the_conversation_continues(make_graph):
+    """§05 escalates to a human after two loops. The escalation is the audit row a reviewer
+    works from — written before the user is told — and the next turn runs normally."""
+    router = StubRouter([RouteResult(False, {}, "Which product line?")])
+    graph, services = make_graph(router=router)
+    invoke(graph, "Do the thing", thread="esc-1")
+    invoke(graph, "The usual", thread="esc-1")
+    third = invoke(graph, "You know which one", thread="esc-1")
+    assert third["outcome"] == "escalated"
+    record = services.audit.records[-1]
+    assert record["outcome"] == "escalated"
+    assert any(e["decision"] == "escalate" for e in record["decision_trail"])
 
-
-def test_an_open_escalation_holds_every_later_turn(make_graph):
-    graph, services = make_graph()
-    _seed_open_review(graph, services, rq.ESCALATION)
-    result = invoke(graph, "Write user stories for the checkout feature")
-    assert result["outcome"] == "review_pending"
-    assert result["final_text"] == msg.REVIEW_PENDING_MESSAGE
-    assert result["open_review"] is not None
-    assert any(e["stage"] == "review" and e["decision"] == "held" for e in result["audit_trail"])
-
-
-def test_an_open_appeal_does_not_freeze_the_conversation(make_graph):
-    graph, services = make_graph()
-    _seed_open_review(graph, services, rq.APPEAL)
-    result = invoke(graph, "Write user stories for the checkout feature on product line alpha")
-    assert result["outcome"] != "review_pending"
-    assert result["open_review"] is not None  # the appealed request stays with the reviewer
-    assert any(e["stage"] == "review" and e["decision"] == "open" for e in result["audit_trail"])
-
-
-def test_a_resolved_review_releases_the_hold_and_records_who_decided(make_graph):
-    graph, services = make_graph()
-    review = _seed_open_review(graph, services, rq.ESCALATION)
-    services.reviews.resolve(review.ref, reviewer="alice", decision=rq.UPHOLD, note="scope")
-    result = invoke(graph, "Write user stories for the checkout feature on product line alpha")
-    assert result["outcome"] != "review_pending"
-    assert result["open_review"] is None
-    resolved = [
-        e for e in result["audit_trail"] if e["stage"] == "review" and e["decision"] == "resolved"
-    ]
-    assert resolved and "alice" in resolved[0]["detail"] and "scope" in resolved[0]["detail"]
-
-
-def test_an_unreachable_queue_fails_closed_only_for_a_conversation_with_a_review_open(make_graph):
-    graph, services = make_graph()
-    _seed_open_review(graph, services, rq.ESCALATION)
-    services.reviews.fail = True
-    result = invoke(graph, "Write user stories for the checkout feature")
-    assert result["outcome"] == "error"
-    assert result["final_text"] == msg.REVIEW_UNAVAILABLE_MESSAGE
-    assert any(e["decision"] == "fail_closed" for e in result["audit_trail"])
-
-    # A conversation with nothing open never touches the queue, so the same
-    # outage is invisible to it.
-    fresh, _ = make_graph(reviews=_Reviews(fail=True))
-    ok = invoke(
-        fresh, "Write user stories for the login feature on product line alpha", thread="t9"
-    )
-    assert ok["outcome"] != "error"
-
-
-def test_a_marker_for_a_deleted_review_row_is_cleared_rather_than_locking_forever(make_graph):
-    graph, _ = make_graph()
-    invoke(graph, "Write user stories for the login feature on product line alpha")
-    graph.update_state(
-        _config(), {"open_review": {"ref": "rev_gone", "kind": rq.ESCALATION}}, as_node="respond"
-    )
-    result = invoke(graph, "Write user stories for the checkout feature on product line alpha")
-    assert result["outcome"] != "review_pending"
-    assert result["open_review"] is None
+    router.results = [RouteResult(True, {"product_line": "alpha"})]
+    fourth = invoke(graph, "Write user stories for login on product line alpha", thread="esc-1")
+    assert fourth["outcome"] == "answer"

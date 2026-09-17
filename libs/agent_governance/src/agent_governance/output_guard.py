@@ -1,22 +1,21 @@
 """Output guardrail (layer 7) — the last check before generated text reaches a user.
 
 Entry points: `OutputGuard` (`screen` a reply, `relay` text to a worker, `scrub` model-written
-governance text, `stream_should_hold`), `StreamGuard` (hold-back window over live tokens),
-`OutputPolicy` (category → allow/mask/block/escalate, overridable per governed document) and
+governance text), `OutputPolicy` (category → allow/mask/block/escalate, overridable per governed document) and
 `PROCESS_CANARY` / `usable_canary` for prompt-leak detection. Tiers follow Google DLP, Bedrock
-Guardrails and Databricks `detect_sensitive_data`; not a toxicity/LLM pass (AI Gateway's job).
+Guardrails and Databricks `detect_sensitive_data`; not a toxicity/LLM pass.
 """
 
 from __future__ import annotations
 
 import re
 import secrets
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
-from . import sensitive
+from . import sensitive_data as sensitive
 from .deny_rules import compile_rules
-from .sensitive import Finding
+from .sensitive_data import Finding
 
 # ── actions ─────────────────────────────────────────────────────────────────
 ALLOW = "allow"
@@ -60,7 +59,7 @@ def _condense(text: str) -> str:
 
 
 #: The floor a canary must clear to be armed: matched on the condensed form, a punctuation-only
-#: token never fires. `config_store` refuses to publish one — validator and detector must agree.
+#: token never fires. `governed_config_store` refuses to publish one — validator and detector must agree.
 CANARY_MIN_CONDENSED = 6
 
 
@@ -311,110 +310,3 @@ class OutputGuard:
             return fallback
         masked, _ = self.relay(text)
         return masked
-
-    # ── streaming ────────────────────────────────────────────────────────
-
-    def stream_should_hold(self, buffer: str) -> bool:
-        """Whether streaming must stop: a withhold-tier finding or a leak."""
-        if self.leak_in(buffer):
-            return True
-        if "-----BEGIN" in buffer:
-            return True
-        for rule in self._rules:
-            if rule.regex.search(buffer):
-                return True
-        for finding in sensitive.scan(buffer, self._policy.active_categories()):
-            for category in finding.categories or (finding.category,):
-                if self._policy.action_for(category) in (BLOCK, ESCALATE):
-                    return True
-        return False
-
-    def stream_findings(self, buffer: str) -> tuple[Finding, ...]:
-        """Every finding in a stream buffer, with spans into that buffer."""
-        return tuple(sensitive.scan(buffer, self._policy.active_categories()))
-
-
-class StreamGuard:
-    """Hold-back window over live worker tokens.
-
-    Masks against `context + pending`, never the chunk alone: context-gated shapes and values
-    straddling the cut would otherwise leak. The release point is clamped back to the start of
-    any finding extending past it, and a withhold-tier finding anywhere stops emission.
-    """
-
-    #: `github_pat_` tokens and JWTs reach ~260 chars (private-key blocks are caught on
-    #: `-----BEGIN` instead). A smaller hold is still safe: partly-seen values are never released.
-    LONGEST_SHAPE_HINT = 260
-
-    def __init__(self, guard: OutputGuard, hold: int = 160):
-        self._guard = guard
-        self._hold = max(0, hold)
-        self._pending = ""
-        # The tail of what has already gone out, kept only as scanning context.
-        self._context = ""
-        self.suppressed = False
-
-    def feed(self, text: str) -> str:
-        """Accept one token; return the (masked) text safe to emit now."""
-        if not text or self.suppressed:
-            return ""
-        self._pending += text
-        if self._guard.stream_should_hold(self._context + self._pending):
-            self.suppressed = True
-            return ""
-        if self._hold == 0:
-            return self._release(len(self._pending))
-        surplus = len(self._pending) - self._hold
-        if surplus <= 0:
-            return ""
-        window = self._pending[:surplus]
-        cut = max(window.rfind("\n"), window.rfind(". "))
-        if cut < 0 and surplus > 3 * self._hold:
-            cut = window.rfind(" ")
-        if cut < 0:
-            # No line, sentence or word boundary (base64 blob, minified output, CJK prose):
-            # rescanning an unbounded buffer per token goes quadratic, so past this ceiling
-            # cut mid-token — safe, because `_release` clamps out any partly-seen value.
-            if surplus <= 4 * self._hold:
-                return ""
-            cut = surplus - 1
-        return self._release(cut + 1)
-
-    def flush(self) -> str:
-        """Emit whatever remains once the stream has ended.
-
-        No clamping: nothing can grow further once the stream ends, so masking it all is correct.
-        """
-        if self.suppressed or not self._pending:
-            return ""
-        return self._release(len(self._pending), clamp=False)
-
-    def _release(self, count: int, clamp: bool = True) -> str:
-        """Emit the first `count` characters of `pending`, masked in context.
-
-        `_context` is the already-masked tail of what went out, so a gating word is still present
-        and no finding can *start* inside it, so `start - offset` is a valid span in `pending`.
-        """
-        buffer = self._context + self._pending
-        offset = len(self._context)
-        findings = self._guard.stream_findings(buffer)
-
-        if clamp:
-            limit = offset + count
-            for finding in findings:
-                if finding.start < limit < finding.end:
-                    limit = min(limit, finding.start)
-            count = max(0, limit - offset)
-            if count <= 0:
-                return ""
-
-        raw = self._pending[:count]
-        inside = [
-            replace(finding, start=finding.start - offset, end=finding.end - offset)
-            for finding in findings
-            if finding.start >= offset and finding.end <= offset + count
-        ]
-        emitted = sensitive.mask(raw, inside) if inside else raw
-        self._pending = self._pending[count:]
-        self._context = (self._context + emitted)[-max(self._hold, 40) :]
-        return emitted

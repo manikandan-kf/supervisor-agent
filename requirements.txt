@@ -1,6 +1,6 @@
 # Runtime dependencies for the Model Serving container.
 #
-# `deploy/log_and_deploy.py` passes this file to `mlflow.pyfunc.log_model(
+# `deploy/deploy_agent.py` passes this file to `mlflow.pyfunc.log_model(
 # pip_requirements=...)`, so it is baked into the model artifact and is what the
 # endpoint installs. `pyproject.toml` mirrors it for local development and CI;
 # change both together.
@@ -24,7 +24,7 @@ mlflow==3.15.1
 # durability=, and the custom/messages stream modes the task plan uses.
 langgraph==1.2.11
 langchain-core==1.5.3
-# `init_chat_model` — the provider is configuration, not code (model_provider.py).
+# `init_chat_model` — the provider is configuration, not code (llm_provider.py).
 langchain==1.2.10
 # [memory] pulls the Lakebase checkpointer/store extras (connection pool with
 # rotating OAuth credentials) — memory.py's production mode depends on them.

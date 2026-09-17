@@ -1,7 +1,7 @@
 # Worker agent registry.
 # Onboarding a new agent = adding an entry here — no supervisor code change.
 #
-# id               stable identifier the Governance Front Door sends as agent_id
+# id               stable identifier the caller sends as `agent_id` in custom_inputs
 # endpoint         the worker's Databricks Model Serving endpoint name
 # domain_scope     what the semantic screen judges queries against, per agent
 # required_context context keys route/clarify must resolve before dispatch
@@ -12,7 +12,7 @@
 #                  domain. Omitted = the global ROUTING_LLM_ENDPOINT. Honoured
 #                  only when MULTI_MODEL_ENABLED=true on the supervisor
 #                  endpoint; until then a declared value is ignored (logged
-#                  once). Never the worker's own internal model (ASM-03) —
+#                  once). Never the worker's own internal model —
 #                  `endpoint` is still where the dispatch goes.
 #
 # approval_patterns  requests to THIS agent matching one of these have their

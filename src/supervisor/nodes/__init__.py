@@ -11,12 +11,12 @@ Identity arrives as `Runtime[SupervisorContext]`, never from state (see `state.p
 from __future__ import annotations
 
 from .approval import ApprovalMixin
+from .base import GOVERNANCE_OUTCOMES, NodeBase
 from .dispatch import DispatchMixin
 from .guardrails import GuardrailsMixin
 from .rbac_gate import RbacGateMixin
 from .respond import RespondMixin
 from .route import RouteMixin
-from .turn import GOVERNANCE_OUTCOMES, NodeBase
 
 __all__ = ["GOVERNANCE_OUTCOMES", "SupervisorNodes"]
 

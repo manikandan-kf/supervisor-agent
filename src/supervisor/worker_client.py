@@ -14,17 +14,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, Protocol
 
-from agent_governance.resilience import is_transient, jittered
+from agent_governance.retry_and_deadline import is_transient, jittered
 from agent_governance.sanitize import untrusted_turn
-from agent_governance.trust import (
-    DISPATCH_SIGNATURE_FIELD,
-    new_nonce,
-    sign_dispatch,
-    trust_secret,
-)
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from .prompt_provider import get_prompt
+from .prompt_registry import get_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +83,7 @@ class WorkerClient(Protocol):
         conversation_id: str,
         user_role: str,
         trace: dict,
-        # The turn's remaining time budget (§05 Stage 05). Part of the protocol because the
+        # The turn's remaining time budget (solution §05). Part of the protocol because the
         # dispatch stage always passes it; a conforming client without it would TypeError.
         deadline=None,
     ) -> WorkerResponse: ...
@@ -123,7 +117,7 @@ class ModelServingWorkerClient:
 
         `Config.http_timeout_seconds` defaults to `None`, so a bare `WorkspaceClient()` waits
         on a stalled worker forever and the retry/breaker never engages. Setting it turns a
-        hang into a transient failure (`resilience.is_transient` matches on "timeout").
+        hang into a transient failure (`retry_and_deadline.is_transient` matches on "timeout").
         """
         if self._w is None:
             from databricks.sdk import WorkspaceClient
@@ -145,25 +139,18 @@ class ModelServingWorkerClient:
         """One governed dispatch, retried with backoff behind a circuit breaker.
 
         `deadline` is checked before each attempt *and* each backoff sleep: otherwise three
-        45-second attempts plus backoff spend 138s inside a node the gateway has abandoned.
+        45-second attempts plus backoff spend 138s inside a node the caller has given up on.
         """
         custom_inputs = {
             "conversation_id": conversation_id,
             "user_role": user_role,
             "context": context,
-            # §1.10 — correlation fields travel with every request so one user action
-            # stitches together across UI, front door, supervisor and worker.
+            # Correlation fields travel with every request so one user action stitches
+            # together across caller, supervisor and worker (solution §08 tracing).
             **{k: v for k, v in (trace or {}).items() if v},
         }
-        # ── Dispatch integrity (ASI07) ──────────────────────────────────────
-        # Nothing signed what we send a worker, so only the endpoint ACL separated a forged
-        # dispatch from a real one. Attached last, over the final values, and only when a secret
-        # is configured, so an unconfigured deployment sends its previous payload. See trust.py.
-        secret = trust_secret()
-        if secret:
-            custom_inputs["nonce"] = new_nonce()
-            custom_inputs[DISPATCH_SIGNATURE_FIELD] = sign_dispatch(custom_inputs, secret)
-
+        # A worker trusts this dispatch because only the supervisor endpoint's service
+        # identity holds CAN QUERY on the worker endpoint (declared as a model resource).
         payload = {"input": messages, "custom_inputs": custom_inputs}
 
         self._breaker.ensure_closed(agent.id)
@@ -262,7 +249,7 @@ def _extract_text(raw: dict) -> str:
     return ""
 
 
-# §4.1 — the template lives in the MLflow Prompt Registry with the governance prompts,
+# The template lives in the MLflow Prompt Registry with the governance prompts,
 # not inline: it is the one prompt that writes text a user reads.
 _SIMULATION_PROMPT_NAME = "supervisor_worker_simulation"
 
@@ -292,16 +279,13 @@ def _plant_canary(rules: str) -> str:
 class SimulatedWorkerClient:
     """Stands in for worker endpoints that do not exist yet.
 
-    ASM-03 puts the workers outside this scope. Until they exist, an echo mock makes the
+    The worker agents are outside this repository. Until they exist, an echo mock makes the
     routed result look broken, so this produces a domain-shaped answer with the supervisor's
     model, labelled simulated. Unsetting SUPERVISOR_MOCK_WORKERS swaps in the real client.
     """
 
-    def __init__(self, llm, max_tokens: int = 0, model_for=None):
-        # Output-side partner to the prompt's length rule: bounds the damage when a model
-        # ignores it. bind() so the cap rides every invoke.
-        self._llm = llm.bind(max_tokens=max_tokens) if max_tokens > 0 else llm
-        self._max_tokens = max_tokens
+    def __init__(self, llm, model_for=None):
+        self._llm = llm
         # Optional `agent -> chat model` resolver so a simulated worker spends the endpoint
         # its registry entry names rather than the router's. None keeps the shared model.
         self._model_for = model_for
@@ -333,12 +317,8 @@ class SimulatedWorkerClient:
             resolved_context=dict(context or {}),
             conversation=[f"{m['role']}: {m['content']}" for m in messages[-8:]] or ["(empty)"],
         )
-        llm = self._llm
-        if self._model_for is not None:
-            # Re-bound per invoke: the resolver may hand back a different cached
-            # client per agent, and the token cap must ride whichever answers.
-            resolved = self._model_for(agent)
-            llm = resolved.bind(max_tokens=self._max_tokens) if self._max_tokens > 0 else resolved
+        # Resolved per invoke: the resolver may hand back a different cached client per agent.
+        llm = self._model_for(agent) if self._model_for is not None else self._llm
         try:
             content = llm.invoke(
                 [SystemMessage(content=rules), HumanMessage(content=payload)]

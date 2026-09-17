@@ -1,6 +1,6 @@
 """The sensitive-data catalogue — what it must catch, what it must not.
 
-`sensitive.py` is read by three boundaries (persistence redactor, worker relay, output
+`sensitive_data.py` is read by three boundaries (persistence redactor, worker relay, output
 guard), so a shape pinned here is pinned for all three. Attack strings are worst-case worker
 replies; benign ones are SDLC prose, and over-redacting an HLD costs more than it saves.
 """
@@ -8,8 +8,8 @@ replies; benign ones are SDLC prose, and over-redacting an HLD costs more than i
 from __future__ import annotations
 
 import pytest
-from agent_governance import sensitive
-from agent_governance.sensitive import (
+from agent_governance import sensitive_data as sensitive
+from agent_governance.sensitive_data import (
     iban_valid,
     luhn_valid,
     nhs_valid,

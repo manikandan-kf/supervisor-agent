@@ -9,18 +9,15 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from agent_governance import grounding, review_queue
-from agent_governance.resilience import BudgetExhausted, deadline_for
-from agent_governance.review_queue import ReviewQueueError
+from agent_governance.retry_and_deadline import BudgetExhausted, deadline_for
 from agent_governance.sanitize import (
     clean_worker_output,
 )
 from langgraph.runtime import Runtime
 from langgraph.types import Command
 
-from .. import session_notes
-from ..messages import (
-    APPEAL_NOTE,
+from ..state import SupervisorContext
+from ..user_facing_text import (
     CARRIED_CONTEXT_NOTICE,
     DEFERRED_REQUEST_OFFER,
     DEFERRED_REQUEST_REFUSED,
@@ -30,14 +27,10 @@ from ..messages import (
     SENSITIVE_INPUT_NOTICE,
     WORKER_UNAVAILABLE_MESSAGE,
     context_prose,
-    progress,
-    progress_sources,
     sensitive_prose,
 )
-from ..state import SupervisorContext
 from ..worker_client import WorkerUnavailable
-from .limits import LimitsMixin
-from .turn import (
+from .base import (
     RelayScreen,
     _clean_sources,
     _entry,
@@ -47,11 +40,12 @@ from .turn import (
     _window,
     _worker_messages,
 )
+from .failsafes import FailsafesMixin
 
 logger = logging.getLogger(__name__)
 
 
-class DispatchMixin(LimitsMixin):
+class DispatchMixin(FailsafesMixin):
     def dispatch(
         self, state: dict, runtime: Runtime[SupervisorContext]
     ) -> Command[Literal["respond", "approval"]]:
@@ -59,24 +53,14 @@ class DispatchMixin(LimitsMixin):
         deadline = deadline_for(context, self.s.settings)
         agent = self.s.registry.get(state["target_agent_id"])
         resolved = state.get("route", {}).get("resolved_context", {})
-        progress("dispatch", "started", agent.name, agent=agent.name)
-
-        # Notes are prepended, not merged into history, so they survive trimming. The worker
-        # is the *only* consumer: a note cannot change a governance decision, only a draft.
-        notes = session_notes.worker_message(state.get("session_notes"))
 
         # ── The relay boundary (guardrail layer 7, inbound half) ─────────────
-        # What the worker receives is screened by the same policy as what it returns. A note
-        # is the user's own text and goes through it too.
+        # What the worker receives is screened by the same policy as what it returns.
         relay = _worker_messages(
             _window(state.get("messages"), self.s.settings.worker_history_max_tokens),
             guard=self.s.output_guard,
         )
         relay_masked = list(relay.masked)
-        if notes:
-            note_text, note_findings = self.s.output_guard.relay(notes["content"])
-            notes = {**notes, "content": note_text}
-            relay_masked.extend(f.label for f in note_findings)
 
         # Resolved context is model-lifted from the conversation, so it is a second route to
         # the worker for a value the relay just masked; `memory._validate` only bounds storage.
@@ -92,12 +76,12 @@ class DispatchMixin(LimitsMixin):
             deadline.ensure(f"dispatch to {agent.id}")
             resp = self.s.workers.invoke(
                 agent,
-                ([notes] if notes else []) + relay.messages,
+                relay.messages,
                 resolved,
                 state.get("conversation_id", ""),
                 context.user_role,
-                # §1.10 — the correlation set, so the worker's traces join this turn's.
-                # `user_key` is pseudonymous; no raw subject or token leaves the gateway.
+                # The correlation set, so the worker's traces join this turn's (solution §08).
+                # `user_key` is pseudonymous; no raw subject or token reaches a worker.
                 {
                     "correlation_id": context.correlation_id,
                     "request_id": state.get("request_id", ""),
@@ -113,7 +97,6 @@ class DispatchMixin(LimitsMixin):
             # The client already retried and the breaker has spoken — a clear "unavailable"
             # message, never another LLM-generated prompt.
             logger.warning("worker unavailable for %s: %s", agent.id, exc)
-            progress("dispatch", "error", "worker unavailable")
             return Command(
                 goto="respond",
                 update={
@@ -134,7 +117,6 @@ class DispatchMixin(LimitsMixin):
                 str(exc)[:200],
             )
             logger.debug("worker dispatch traceback", exc_info=True)
-            progress("dispatch", "error", type(exc).__name__)
             return Command(
                 goto="respond",
                 update={
@@ -150,7 +132,7 @@ class DispatchMixin(LimitsMixin):
         # only after the guard: a withheld response must not have leaked its citation titles.
         sources = _clean_sources(resp.sources, self.s.output_guard)
 
-        # ── Worker output is untrusted (§05 Stage 06) ────────────────────────
+        # ── Worker output is untrusted (solution §02: "the worker's response is validated") ──
         # Bounded and sanitized *before* the text reaches state: as an AIMessage it becomes
         # history replayed into governance prompts, where a fake turn boundary would pass as real.
         cleaned = clean_worker_output(
@@ -177,17 +159,6 @@ class DispatchMixin(LimitsMixin):
                     agent.id,
                     relay.directives,
                 )
-        if notes:
-            # A dispatch shaped by something said turns ago has inputs outside the current
-            # message; the trail must say so or "why did it produce that?" is unanswerable.
-            output_trail.append(
-                _entry(
-                    "dispatch",
-                    "notes_recalled",
-                    f"{len(state.get('session_notes') or [])} session note(s) sent to "
-                    f"{agent.id} as background",
-                )
-            )
         if cleaned.modified or cleaned.code_blocks:
             output_trail.append(_entry("dispatch", "output_sanitized", cleaned.audit_detail()))
         if cleaned.role_markers or cleaned.template_markers:
@@ -206,50 +177,29 @@ class DispatchMixin(LimitsMixin):
         # branch on purpose: a staged artifact is screened exactly like a delivered answer.
         guarded = self.s.output_guard.screen(text)
         # getattr: a stub predating the escalate tier must degrade to "block", never "deliver".
-        # `open_review` short-circuits: a second review row would overwrite the live marker.
-        if getattr(guarded, "escalate", False) and not state.get("open_review"):
-            # Withheld *and* handed to a human, conversation held. If the review cannot be
-            # recorded the response is still withheld and no reviewer is promised (§08).
+        if getattr(guarded, "escalate", False):
+            # Withheld, and recorded as an escalation rather than a block: a leak or a data
+            # dump is a finding a reviewer must see apart from an ordinary policy match.
             logger.warning(
                 "worker %s response escalated by the output guard: %s", agent.id, guarded.reason
             )
-            try:
-                review = self.s.reviews.open_review(
-                    kind=review_queue.ESCALATION,
-                    conversation_id=state.get("conversation_id", ""),
-                    reason=f"output guard: {guarded.reason}",
-                    user_key=context.user_key,
-                    user_role=context.user_role,
-                    target_agent_id=agent.id,
-                    request_id=state.get("request_id", ""),
-                    correlation_id=context.correlation_id,
-                    query_excerpt=_excerpt(_latest_user_text(state.get("messages"))),
-                )
-            except (ReviewQueueError, ValueError) as exc:
-                logger.warning("could not open an output-guard escalation: %s", exc)
-            else:
-                progress("dispatch", "error", "response escalated for review")
-                return Command(
-                    goto="respond",
-                    update={
-                        "pending_approval": None,
-                        "worker_response": {"status": resp.status, "stage": resp.stage},
-                        "outcome": "escalated",
-                        "final_text": OUTPUT_ESCALATED_MESSAGE,
-                        "appealable": None,
-                        "open_review": {"ref": review.ref, "kind": review.kind},
-                        "audit_trail": _trail(
-                            state,
-                            "output_guard",
-                            "escalated",
-                            f"{guarded.audit_detail()} — escalation {review.ref} opened, "
-                            "conversation held for review",
-                        )
-                        + output_trail,
-                    },
-                )
+            return Command(
+                goto="respond",
+                update={
+                    "pending_approval": None,
+                    "worker_response": {"status": resp.status, "stage": resp.stage},
+                    "outcome": "escalated",
+                    "final_text": OUTPUT_ESCALATED_MESSAGE,
+                    "audit_trail": _trail(
+                        state,
+                        "output_guard",
+                        "escalated",
+                        f"{guarded.audit_detail()} — recorded for a human reviewer",
+                    )
+                    + output_trail,
+                },
+            )
         if guarded.blocked:
-            progress("dispatch", "error", "response withheld")
             logger.warning(
                 "worker %s response withheld by the output guard: %s",
                 agent.id,
@@ -261,10 +211,9 @@ class DispatchMixin(LimitsMixin):
                     "pending_approval": None,
                     "worker_response": {"status": resp.status, "stage": resp.stage},
                     "outcome": "blocked",
-                    "final_text": " ".join((OUTPUT_WITHHELD_MESSAGE, APPEAL_NOTE)),
-                    # Appealable like an input-tier block: a false-positive
-                    # output rule needs a human way forward too (§06).
-                    "appealable": {"reason": guarded.reason, "tier": "output_policy"},
+                    # Final, like an input-tier block: the event is in the trail for review,
+                    # and there is no appeal path from the conversation.
+                    "final_text": OUTPUT_WITHHELD_MESSAGE,
                     "audit_trail": _trail(state, "output_guard", "withheld", guarded.audit_detail())
                     + output_trail,
                 },
@@ -272,20 +221,6 @@ class DispatchMixin(LimitsMixin):
         text = guarded.text
         if guarded.modified:
             output_trail.append(_entry("output_guard", "masked", guarded.audit_detail()))
-
-        # ── Grounding cue (layer 7, hallucination checks) ────────────────────
-        # The supervisor cannot verify a claim against evidence it does not hold; it can refuse
-        # to let "the rollback completed" pass as verified when nothing verified it.
-        if text and self.s.settings.output_provenance_notes:
-            grounded = grounding.check(text, sources, resp.raw)
-            if grounded.flagged:
-                text = grounding.annotate(text, grounded)
-                output_trail.append(_entry("grounding", "unverified", grounded.audit_detail()))
-
-        # Only now, with the response cleared by the guard, do the citations
-        # reach the calling UI — a withheld reply shows none.
-        if sources:
-            progress_sources(sources)
 
         # ── Supervisor-enforced approval (Solution §04) ──────────────────────
         # A registry `approval_patterns` match stages the response on the supervisor's own
@@ -311,7 +246,6 @@ class DispatchMixin(LimitsMixin):
                     f"({agent.risk_level} risk): {mandated}"
                     + ("" if resp.status == "approval_pending" else "; worker did not request one")
                 )
-            progress("dispatch", "done", f"awaiting approval: {stage}")
             return Command(
                 goto="approval",
                 update={
@@ -334,7 +268,6 @@ class DispatchMixin(LimitsMixin):
             )
 
         if not text:
-            progress("dispatch", "error", "empty response")
             return Command(
                 goto="respond",
                 update={
@@ -404,7 +337,6 @@ class DispatchMixin(LimitsMixin):
                     )
                 )
 
-        progress("dispatch", "done")
         return Command(
             goto="respond",
             update={

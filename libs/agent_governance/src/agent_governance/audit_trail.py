@@ -5,7 +5,7 @@ no extra entitlement) or the process-log `LoggingAuditLogger` fallback, and wrap
 `TracingAuditLogger` so each decision also lands on the request's MLflow trace. `verify_chain` /
 `ChainVerification` walk the tamper-evidence hash chain. No SQL-warehouse sink: the endpoint's
 service principal cannot hold `databricks-sql-access`. Trace destination is a deployment choice
-(`deploy/log_and_deploy.py --trace-catalog-schema`).
+(`deploy/deploy_agent.py --trace-catalog-schema`).
 """
 
 from __future__ import annotations
@@ -37,23 +37,19 @@ CREATE TABLE IF NOT EXISTS {table} (
   latency_ms          INTEGER,
   session_age_seconds DOUBLE PRECISION,
   signoff             JSONB,
-  model_calls         INTEGER,
-  tokens_estimated    INTEGER,
   provenance          JSONB,
   prev_hash           TEXT,
   row_hash            TEXT
 )
 """
 
-# Columns added after the table shipped (§05 Stage 06 latency; Stage 04 session age and signoff;
-# cost fields). *Detected* via `information_schema`, never ALTERed: `ALTER TABLE` takes the same
+# Columns added after the table shipped (latency, session age, signoff, provenance, the hash
+# pair). *Detected* via `information_schema`, never ALTERed: `ALTER TABLE` takes the same
 # ownership check as `CREATE INDEX` (see `_ensure_table`) and would abort the INSERT with it.
 _OPTIONAL_COLUMNS = (
     "latency_ms",
     "session_age_seconds",
     "signoff",
-    "model_calls",
-    "tokens_estimated",
     "provenance",
     "prev_hash",
     "row_hash",
@@ -78,7 +74,7 @@ _CHAIN_COLUMNS = (
     *(c for c in _OPTIONAL_COLUMNS if c not in ("prev_hash", "row_hash")),
 )
 
-# ── Tamper evidence (§10) ───────────────────────────────────────────────────
+# ── Tamper evidence ─────────────────────────────────────────────────────────
 # `row_hash` = digest(previous `row_hash` + canonical row content), anchored at `_GENESIS`: editing
 # or deleting history breaks every later digest (`verify_chain`). Writers serialise on an advisory
 # lock so replicas cannot fork. Evident, not impossible: the runtime identity is append-only.
@@ -91,8 +87,8 @@ def _row_digest(prev_hash: str, payload: dict) -> str:
     return hashlib.sha256((prev_hash + canonical).encode("utf-8")).hexdigest()
 
 
-# Usage reporting is by user, agent, environment and run (§2.13), so those are
-# the columns worth an index.
+# Usage reporting is by user and agent (solution §07 KPIs), so those are the
+# columns worth an index.
 _PG_INDEX = """
 CREATE INDEX IF NOT EXISTS {table}_lookup_idx
   ON {table} (user_key, target_agent_id, event_time DESC)
@@ -102,7 +98,7 @@ CREATE INDEX IF NOT EXISTS {table}_lookup_idx
 class LoggingAuditLogger:
     """Fallback — writes the decision trail to the process log.
 
-    Never lost, but not queryable, so it does not satisfy BR-006 on its own.
+    Never lost, but not queryable, so it is not an audit table on its own.
     """
 
     def log(self, record: dict) -> None:

@@ -1,6 +1,6 @@
 """Route / clarify stage.
 
-The target agent is already fixed by the chat widget, so routing here means
+The target agent is already fixed by the caller, so routing here means
 resolving the context the worker needs (e.g. product line). When context is
 ambiguous the supervisor asks one clarifying question and resumes on the
 reply, escalating to a human after the configured number of loops.
@@ -11,12 +11,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from agent_governance.resilience import invoke_with_retries
+from agent_governance.retry_and_deadline import invoke_with_retries
 from agent_governance.sanitize import untrusted_turn
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from .prompt_provider import get_prompt
+from .prompt_registry import get_prompt
 
 
 @dataclass(frozen=True)
@@ -28,7 +28,7 @@ class RouteResult:
     # the result so the trail records the drop — a silent vanish is otherwise invisible.
     dropped_context: tuple[str, ...] = ()
     # False when the request does not depend on the required context at all. On the result
-    # so the trail records *why* nothing was asked (BR-004).
+    # so the trail records *why* nothing was asked.
     context_applies: bool = True
 
 
@@ -77,11 +77,11 @@ class RouteDecision(BaseModel):
     )
 
 
-# §4.1: prompts load from MLflow Prompt Registry by name and environment alias.
+# Prompts load from the MLflow Prompt Registry by name and environment alias.
 _PROMPT_NAME = "supervisor_routing"
 
 
-class Router:
+class ContextResolver:
     def __init__(self, llm, model_for=None):
         self._llm = llm
         # Optional `agent -> chat model` resolver so context resolution runs on the model the
@@ -98,7 +98,7 @@ class Router:
     ) -> RouteResult:
         """Resolve the agent's required context, or ask for what is missing.
 
-        `deadline` (§05 Stage 05) is checked only when a model call is actually needed: an
+        `deadline` (solution §05, the turn time budget) is checked only when a model call is needed: an
         agent with no `required_context` returns for free, and an exhausted budget must not
         turn that free path into a failure. None disables the check.
         """
@@ -124,7 +124,7 @@ class Router:
             carried_over_from_earlier=carried_over,
             conversation=history[-12:] or ["(start of conversation)"],
         )
-        # Transient failures retry here, at the single call — see resilience.py
+        # Transient failures retry here, at the single call — see retry_and_deadline.py
         # for why this replaced the graph-level RetryPolicy that never fired.
         llm = self._model_for(agent) if self._model_for is not None else self._llm
         decision = invoke_with_retries(

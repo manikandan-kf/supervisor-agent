@@ -2,7 +2,7 @@
 
 Outbound (`untrusted_turn`, `system_blocks`): rules in the system turn, data in a JSON user turn
 that no value can escape. Inbound (`clean_inbound_text`, `clean_worker_output`,
-`neutralise_history_text`, `neutralise_embedded_directives`) is Governance Blueprint Stage 06:
+`neutralise_history_text`, `neutralise_embedded_directives`) treats worker output as untrusted:
 flattened history lets untrusted text impersonate a turn boundary, and defanging it is a control
 where a prompt instruction is not (NIST SP 800-207 §5.7). Mechanical markers only, not intent.
 """

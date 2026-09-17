@@ -1,10 +1,9 @@
 """Publish governance configuration to the Unity Catalog table.
 
-A guardrail rule, role mapping or worker registry entry changes by publish, not redeploy: R1
-puts configuration "directly in Unity Catalog tables (pre-wrapper-API)", so the table is the
-source of record, `supervisor.config` reads it at runtime and this script is the write path, with
+A guardrail rule, role mapping or worker registry entry changes by publish, not redeploy:
+solution §02 puts configuration in governed tables, so the table is the source of record, `supervisor.governed_config` reads it at runtime and this script is the write path, with
 deliberately no validating service in front. The table is Lakebase Postgres surfaced as the UC
-catalog `supervisor_memory` (`config_store` explains why). Nothing is written without `--apply` or
+catalog `supervisor_memory` (`governed_config_store` explains why). Nothing is written without `--apply` or
 `--pin`; a payload identical to the active version is skipped, so a deploy job mints no versions.
 """
 
@@ -37,14 +36,14 @@ ROOT = _repo_root()
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "libs" / "agent_governance" / "src"))
 
-from agent_governance.config_store import (  # noqa: E402
+from agent_governance.governed_config_store import (  # noqa: E402
     ConfigError,
     ConfigStore,
     checksum_of,
     load_bundled,
 )
 
-from supervisor.config import CONFIG_NAMES, config_store, validate  # noqa: E402
+from supervisor.governed_config import CONFIG_NAMES, config_store, validate  # noqa: E402
 from supervisor.settings import Settings  # noqa: E402
 
 
@@ -63,7 +62,7 @@ def _policy_report(candidate: dict, config_dir: Path):
     production without a redeploy. The suite sits beside the document so both ship in one diff.
     """
     try:
-        from agent_governance.policy_eval import evaluate, load_suite
+        from agent_governance.policy_suite_eval import evaluate, load_suite
 
         return evaluate(candidate, load_suite(config_dir / "policy_suite.yaml"))
     except Exception as exc:  # noqa: BLE001 — reported, then refused by the caller

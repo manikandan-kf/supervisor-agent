@@ -1,7 +1,7 @@
 # The deployment job: prompts, governed configuration, the shared library, then
 # the model and its endpoint.
 #
-# Three tasks run in parallel; `log_and_deploy` waits for the two whose output
+# Three tasks run in parallel; `deploy_agent` waits for the two whose output
 # the endpoint reads at boot. Every path is built from ${var.catalog} and
 # ${var.schema}, the same variables schema.yml uses, so the two cannot drift.
 
@@ -52,13 +52,13 @@ resources:
               - "--volume"
               - "${var.library_volume}"
 
-        - task_key: log_and_deploy
+        - task_key: deploy_agent
           depends_on:
             - task_key: register_prompts
             - task_key: publish_config
           environment_key: default
           spark_python_task:
-            python_file: deploy/log_and_deploy.py
+            python_file: deploy/deploy_agent.py
             parameters:
               - "--uc-model"
               - "${var.catalog}.${var.schema}.${var.model_name}"

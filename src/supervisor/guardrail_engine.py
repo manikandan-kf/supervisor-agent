@@ -15,13 +15,13 @@ from dataclasses import dataclass
 from typing import Optional
 
 from agent_governance.deny_rules import compile_rules, first_match, kill_switch_message
-from agent_governance.resilience import invoke_with_retries
+from agent_governance.retry_and_deadline import invoke_with_retries
 from agent_governance.sanitize import system_blocks, untrusted_turn
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from .prompt_provider import get_prompt
-from .registry import WorkerAgent
+from .agent_registry import WorkerAgent
+from .prompt_registry import get_prompt
 
 
 @dataclass(frozen=True)
@@ -35,9 +35,6 @@ class GuardrailResult:
     # The screen recognised this agent's subject but not which deliverable was wanted: the one
     # question that would settle it, asked instead of dispatching a guess or refusing.
     clarification: str = ""
-    # A safety refusal rather than a scope refusal. Changes only whether the block offers the
-    # appeal path: a reviewer can overturn "that isn't my agent's subject".
-    safety_refusal: bool = False
     # Two or more reachable agents claimed this with confidences too close to separate; ids, best
     # first. The user is asked which deliverable they meant rather than candidate *order* deciding.
     contested: tuple[str, ...] = ()
@@ -112,24 +109,9 @@ class GuardrailVerdict(BaseModel):
         ),
     )
     reason: str = Field(description="One-sentence justification, addressed to the user")
-    # Kept LAST, so the harm question cannot prime `in_domain`: SDLC work is full of alarming
-    # vocabulary (threat models, pen tests), and asked earlier it turns a request for security
-    # *requirements* into one for harm. Blast radius: only the appeal line of a decided refusal.
-    safety_refusal: bool = Field(
-        default=False,
-        description=(
-            "Last. True ONLY if the request seeks real-world harm — weapons, explosives, "
-            "violence, self-harm, illegal activity, or malware and attacks against systems "
-            "the user does not own. False for every ordinary out-of-scope request (cooking, "
-            "travel, sport, personal advice, IT support): those are simply not this agent's "
-            "subject. False, too, for legitimate software work that merely sounds alarming — "
-            "security requirements, threat models, abuse cases, authorised penetration-test "
-            "planning, incident runbooks. If in doubt, answer false."
-        ),
-    )
 
 
-# §4.1: prompts load from MLflow Prompt Registry by name and environment alias.
+# Prompts load from the MLflow Prompt Registry by name and environment alias.
 _PROMPT_NAME = "supervisor_domain_screen"
 
 # What a refusal costs depends on how many agents the caller can reach — the one thing the screen
@@ -243,7 +225,7 @@ _SMALL_TALK_KINDS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
 
 
 # A message that asks for something to be *produced* is a request. Vetoes `meta_agents` only,
-# which never dispatches, so a false positive there costs the request with nothing to appeal.
+# which never dispatches, so a false positive there silently costs the request.
 # `review`, `test`, `design`, `document`, `describe` are out: they are subject vocabulary too.
 _NAMES_A_DELIVERABLE = re.compile(
     r"\b(?:write|draft|generate|produce|implement|refactor|spec(?:ify)?|"
@@ -429,7 +411,7 @@ class GuardrailEngine:
 
         `candidates` is the caller's *permitted* agents, target first; nothing outside it is
         considered, so screening cannot surface or route to an inaccessible agent. `deadline`
-        (§05 Stage 05) is checked before each verdict, because this is one model call per agent.
+        (solution §05, the turn time budget) is checked before each verdict: one model call per agent.
         """
         history = history or []
 
@@ -456,10 +438,6 @@ class GuardrailEngine:
         in_domain: list[tuple[WorkerAgent, GuardrailVerdict]] = []
         unclear: list[tuple[WorkerAgent, GuardrailVerdict]] = []
         best_off: Optional[GuardrailVerdict] = None
-        # Tracked across every candidate rather than read off `best_off`, which
-        # is selected by confidence and could be a different agent's verdict.
-        # Whether a request seeks harm is a property of the request.
-        flagged_unsafe = False
         sole = len(candidates) == 1
         # With one reachable agent there is no ordering to be misled by, so the
         # higher bar buys nothing and would only relabel a settled verdict as a
@@ -473,13 +451,12 @@ class GuardrailEngine:
                 continue
 
             # Before the call, not after: checked after it would only report an overrun that
-            # already happened. A partial screen never becomes a pass (§06 fail-closed).
+            # already happened. A partial screen never becomes a pass (solution §05, fail closed).
             if deadline is not None:
                 deadline.ensure(f"screening against {agent.id}")
 
             considered.append(agent.id)
             verdict = self._semantic_verdict(query, agent, history, sole=sole, deadline=deadline)
-            flagged_unsafe = flagged_unsafe or verdict.safety_refusal
 
             if verdict.in_domain and verdict.confidence >= decisive:
                 # Only a *decisive* verdict short-circuits: a merely above-threshold one
@@ -586,7 +563,7 @@ class GuardrailEngine:
         if best_off is not None:
             return ScreenResult(
                 None,
-                GuardrailResult(False, "semantic", best_off.reason, safety_refusal=flagged_unsafe),
+                GuardrailResult(False, "semantic", best_off.reason),
                 tuple(considered),
             )
 

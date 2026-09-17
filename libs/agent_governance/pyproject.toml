@@ -19,9 +19,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dynamic = ["version"]
 dependencies = [
-    # spend.py counts tokens with langchain's approximate counter.
-    "langchain-core>=1.0",
-    # config_store.py reads the bundled YAML seed documents.
+    # governed_config_store.py and policy_suite_eval.py read YAML documents.
     "PyYAML>=6.0",
 ]
 

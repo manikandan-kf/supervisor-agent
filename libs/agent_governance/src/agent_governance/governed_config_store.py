@@ -135,7 +135,7 @@ def validate_deny_rules(payload: dict, section: str) -> None:
 
 def _validate_output_policy(payload: dict) -> None:
     """The per-category tier map consumed by `output_guard.OutputPolicy`."""
-    from . import sensitive
+    from . import sensitive_data as sensitive
     from .output_guard import ACTIONS
 
     section = payload.get("output_policy")
