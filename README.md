@@ -101,7 +101,6 @@ not stated below.
 | `CONTRIBUTING.md`, `SECURITY.md`, `LICENSE` | How to contribute, how to report a vulnerability, licence |
 | `databricks.yml` | The Databricks Asset Bundle: variables, the library wheel artifact, the sync set, the `dev` and `prod` targets (solution §08 "CI/CD with DABs") |
 | `resources/deploy_job.yml` | The deploy job: four tasks, one per script in `deploy/` |
-| `resources/schema.yml` | The Unity Catalog schema each environment owns (model, prompts, config, trace tables) |
 | `resources/lakebase.yml` | The Lakebase instance and library volume as bundle resources. Ships disabled; the file says why |
 | `pyproject.toml` | Project metadata, the dependency mirror of `requirements.txt`, ruff / pytest / mypy configuration |
 | `requirements.txt` | What the serving container installs, pinned exactly; baked into the model artifact |

@@ -7,6 +7,62 @@ Notable changes to the supervisor agent. The format follows
 The version here identifies the **source**. A running deployment is identified
 by its Unity Catalog registered-model version, assigned at deploy time.
 
+## [Unreleased]
+
+Deployment only — no runtime behaviour changes, and `src/` is untouched. A
+workspace whose Lakebase is an Autoscaling **project/branch** rather than a
+provisioned instance can now be deployed by the bundle job, which it could not
+be before: the address had to be an environment variable, and a serverless task
+cannot set one.
+
+### Added
+
+- **`--lakebase-project` / `--lakebase-branch`** on `deploy_agent.py` and
+  `publish_config.py`, with matching `lakebase_project` / `lakebase_branch`
+  bundle variables passed by both job tasks. Each flag sets its environment
+  variable inside the process before anything opens a connection, and the
+  deploy stamps both onto the endpoint. They default from the environment, so a
+  workstation run is unchanged.
+- **`--endpoint-secret-scope`** on `deploy_agent.py`, with the
+  `endpoint_secret_scope` bundle variable. Stamps `DATABRICKS_HOST`,
+  `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET` onto the endpoint as
+  `{{secrets/<scope>/<key>}}` references for the path where no Lakebase
+  resource can be declared. Necessary because the same three variables cannot
+  be set in the deploying process — they are its own credentials — and a job
+  task cannot set them at all. A named scope wins over any literal in the
+  deploy shell, so a shell holding a real secret cannot stamp it on the
+  endpoint.
+- **`deploy_wait_minutes`** bundle variable, passed to `deploy_agent.py
+  --wait-minutes` (default `0`, unchanged). Set on a target, `bundle run`
+  fails unless the endpoint reaches `READY` instead of succeeding when the
+  rollout is merely initiated.
+- **DEPLOYMENT.md §7f — Lakebase under Unity Catalog governance.** Registering
+  the Lakebase database as a UC catalog puts the audit trail and conversation
+  state behind UC permissions, lineage and audit logs for every reader that is
+  not the agent. Stated with its limits: the catalog is read-only and needs a
+  Serverless SQL warehouse, so the agent's own writes stay governed by the
+  Postgres grants in §7b — reads governed centrally, writes narrowed to one
+  least-privileged principal.
+- `deploy_agent.py` now reports the Lakebase project it is deploying against,
+  that no resource was declared for it, and whether the container's credentials
+  are secret references — and warns when a project is configured with neither a
+  secret scope nor a client id, which would deploy an endpoint that refuses to
+  serve.
+
+### Removed
+
+- **`resources/schema.yml`** — the bundle no longer owns the Unity Catalog
+  schema. Deploying into a schema that already exists is the common case, and
+  an owned schema is dropped with everything in it by `bundle destroy`,
+  including another project's models. The schema is now one CLI command in
+  DEPLOYMENT.md §4a, which also records the resource definition for a workspace
+  where this bundle really is the schema's sole owner.
+
+### Changed
+- `publish_config.py` names the address it resolved (`project=…, branch=…`)
+  rather than always reporting `LAKEBASE_INSTANCE`, so a publish that reached
+  the wrong database is visible on its first line.
+
 ## [1.3.0] — 2026-09-17
 
 Scope pass against the v1.2 solution document and the Databricks platform.

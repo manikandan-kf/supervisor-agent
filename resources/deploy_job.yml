@@ -3,7 +3,7 @@
 #
 # Three tasks run in parallel; `deploy_agent` waits for the two whose output
 # the endpoint reads at boot. Every path is built from ${var.catalog} and
-# ${var.schema}, the same variables schema.yml uses, so the two cannot drift.
+# ${var.schema}, so every task addresses the same place by construction.
 
 resources:
   jobs:
@@ -31,8 +31,16 @@ resources:
             python_file: deploy/publish_config.py
             parameters:
               - "--apply"
+              # A serverless task can pass parameters but cannot set environment
+              # variables, so the Lakebase address arrives here rather than being
+              # inherited. Instance and project are alternatives; whichever is empty
+              # is ignored, and the project wins if both are set.
               - "--lakebase-instance"
               - "${var.lakebase_instance}"
+              - "--lakebase-project"
+              - "${var.lakebase_project}"
+              - "--lakebase-branch"
+              - "${var.lakebase_branch}"
               - "--lakebase-schema"
               - "${var.lakebase_schema}"
               - "-m"
@@ -66,7 +74,8 @@ resources:
               - "${var.experiment}"
               # Traces persist as UC Delta tables in this target's own schema
               # (solution §08): governed by UC, queryable from SQL, no per-experiment
-              # cap. schema.yml creates that schema, so the grants already hold.
+              # cap. The schema is not created by this bundle, so it must already
+              # carry CREATE TABLE for the deploying identity.
               - "--trace-catalog-schema"
               - "${var.catalog}.${var.schema}"
               - "--routing-endpoint"
@@ -81,12 +90,22 @@ resources:
               - "${var.workers}"
               - "--lakebase-instance"
               - "${var.lakebase_instance}"
+              - "--lakebase-project"
+              - "${var.lakebase_project}"
+              - "--lakebase-branch"
+              - "${var.lakebase_branch}"
               - "--lakebase-schema"
               - "${var.lakebase_schema}"
+              # Empty with a declared instance: the endpoint then holds its own
+              # short-lived per-resource credential and needs no secret at all.
+              - "--endpoint-secret-scope"
+              - "${var.endpoint_secret_scope}"
               - "--multi-model"
               - "${var.multi_model_enabled}"
               - "--deploy-method"
               - "${var.deploy_method}"
+              - "--wait-minutes"
+              - "${var.deploy_wait_minutes}"
 
       environments:
         - environment_key: default

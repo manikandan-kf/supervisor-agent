@@ -244,6 +244,20 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--lakebase-project",
+        default="",
+        help=(
+            "Lakebase Autoscaling project holding the table, for a workspace with a project "
+            "rather than a provisioned instance. Same reason as --lakebase-instance: a job "
+            "task has no environment to inherit from. Wins over --lakebase-instance."
+        ),
+    )
+    parser.add_argument(
+        "--lakebase-branch",
+        default="",
+        help="branch inside --lakebase-project; the project's default branch when empty",
+    )
+    parser.add_argument(
         "--lakebase-schema",
         default="",
         help=(
@@ -258,6 +272,12 @@ def main() -> int:
         # Set before anything resolves a connection — `audit_connection_source()`
         # reads the environment at call time.
         os.environ["LAKEBASE_INSTANCE"] = args.lakebase_instance
+    if args.lakebase_project:
+        # Same timing rule. `lakebase_target()` prefers the project keys over an instance
+        # name, so passing both is not ambiguous — the project wins, deliberately.
+        os.environ["LAKEBASE_PROJECT"] = args.lakebase_project
+    if args.lakebase_branch:
+        os.environ["LAKEBASE_BRANCH"] = args.lakebase_branch
     if args.lakebase_schema:
         # Same timing rule; a flag rather than inherited because a publish that silently went to
         # `public` would write a version nothing reads while reporting success.
@@ -265,11 +285,16 @@ def main() -> int:
     settings = Settings()
     store = _store(settings)
     # With one schema per environment this line is the only difference between publishing to dev
-    # and to prod, so print it rather than leave it to be inferred from the flags.
-    print(
-        f"target: {os.getenv('LAKEBASE_SCHEMA') or 'public'}.{settings.config_table} "
-        f"on {os.getenv('LAKEBASE_INSTANCE') or '(no LAKEBASE_INSTANCE set)'}\n"
-    )
+    # and to prod, so print it rather than leave it to be inferred from the flags. The address is
+    # named the way it was resolved, so a publish that reached the wrong database is visible here
+    # rather than three steps later.
+    if os.getenv("LAKEBASE_PROJECT"):
+        where = f"project={os.environ['LAKEBASE_PROJECT']}"
+        if os.getenv("LAKEBASE_BRANCH"):
+            where += f", branch={os.environ['LAKEBASE_BRANCH']}"
+    else:
+        where = os.getenv("LAKEBASE_INSTANCE") or "(no Lakebase address set)"
+    print(f"target: {os.getenv('LAKEBASE_SCHEMA') or 'public'}.{settings.config_table} on {where}\n")
 
     if args.list:
         return cmd_list(store)

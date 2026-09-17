@@ -290,6 +290,30 @@ def main() -> None:
         "authenticates with DATABRICKS_CLIENT_ID/SECRET instead. DEPLOYMENT.md §6a.",
     )
     parser.add_argument(
+        "--lakebase-project",
+        default=os.getenv("LAKEBASE_PROJECT", ""),
+        help="Lakebase Autoscaling project, for a workspace with a project rather than a "
+        "provisioned instance. Stamped onto the container as LAKEBASE_PROJECT and, with "
+        "--lakebase-branch, is the address the runtime resolves first. No resource is "
+        "declared for it — the MLflow resource type names an instance — so the endpoint "
+        "reaches it with the credentials from --endpoint-secret-scope. DEPLOYMENT.md §6a.",
+    )
+    parser.add_argument(
+        "--lakebase-branch",
+        default=os.getenv("LAKEBASE_BRANCH", ""),
+        help="branch inside --lakebase-project; the project's default branch when empty",
+    )
+    parser.add_argument(
+        "--endpoint-secret-scope",
+        default=os.getenv("ENDPOINT_SECRET_SCOPE", ""),
+        help="Databricks secret scope holding DATABRICKS_HOST, DATABRICKS_CLIENT_ID and "
+        "DATABRICKS_CLIENT_SECRET for the serving container. Stamps them as "
+        "{{secrets/<scope>/<key>}} references, which is the only way to pass them from a "
+        "job task: setting them as real environment variables would break this script's own "
+        "workspace calls. Needed only on the fallback path, where no Lakebase resource can "
+        "be declared. DEPLOYMENT.md §6a.",
+    )
+    parser.add_argument(
         "--lakebase-schema",
         default=os.getenv("LAKEBASE_SCHEMA", ""),
         help="Postgres schema inside the instance that this deployment owns. Set it "
@@ -400,6 +424,21 @@ def main() -> None:
             "Lakebase declared as a resource: no (--lakebase-resource skip). The endpoint "
             "must reach it with DATABRICKS_CLIENT_ID/SECRET; see DEPLOYMENT.md §6a."
         )
+    elif args.lakebase_project:
+        # An Autoscaling project cannot be declared at all: DatabricksLakebase names an
+        # instance. The address is stamped below and the credentials come from the secret
+        # scope, so say so here rather than let a missing resource look like an oversight.
+        print(
+            f"Lakebase: project={args.lakebase_project}"
+            + (f", branch={args.lakebase_branch}" if args.lakebase_branch else "")
+            + " — not declarable as a model resource (the resource type names an instance)."
+        )
+        if not args.endpoint_secret_scope and not os.getenv("DATABRICKS_CLIENT_ID"):
+            print(
+                "  WARNING: no --endpoint-secret-scope and no DATABRICKS_CLIENT_ID. The "
+                "container will have no workspace credentials, fail its first Lakebase "
+                "connection and refuse to serve. See DEPLOYMENT.md §6a."
+            )
 
     # Release traceability: which prompt versions this model version shipped with. Best-effort:
     # the alias must resolve and this identity may not be able to read the registry.
@@ -464,6 +503,13 @@ def main() -> None:
         env_vars["MULTI_MODEL_ENABLED"] = "true"
     if args.lakebase_instance:
         env_vars["LAKEBASE_INSTANCE"] = args.lakebase_instance
+    if args.lakebase_project:
+        # Flags rather than environment passthrough, because a bundle job task can pass
+        # parameters and cannot set environment variables. Both default from the environment,
+        # so a workstation run behaves as it always did.
+        env_vars["LAKEBASE_PROJECT"] = args.lakebase_project
+    if args.lakebase_branch:
+        env_vars["LAKEBASE_BRANCH"] = args.lakebase_branch
     if args.lakebase_schema:
         # The schema a deployment writes to is a deployment property; stamped explicitly so it
         # is reviewable on the endpoint's configuration page next to LAKEBASE_INSTANCE.
@@ -473,8 +519,6 @@ def main() -> None:
     # refuses to serve with one off.
     for passthrough in (
         "LAKEBASE_AUTOSCALING_ENDPOINT",
-        "LAKEBASE_PROJECT",
-        "LAKEBASE_BRANCH",
         "SUPERVISOR_DURABILITY",
         "SUPERVISOR_HISTORY_MAX_TOKENS",
         "WORKER_HISTORY_MAX_TOKENS",
@@ -495,6 +539,17 @@ def main() -> None:
     ):
         if os.getenv(passthrough):
             env_vars[passthrough] = os.environ[passthrough]
+    if args.endpoint_secret_scope:
+        # The same three credentials, addressed instead of read. This wins over the
+        # passthrough above on purpose: a shell that happens to hold a literal secret must not
+        # be able to stamp it onto the endpoint configuration once a scope has been named.
+        scope = args.endpoint_secret_scope
+        for key in ("DATABRICKS_HOST", "DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET"):
+            env_vars[key] = f"{{{{secrets/{scope}/{key}}}}}"
+        print(
+            f"Workspace credentials for the container: {{{{secrets/{scope}/…}}}} "
+            "(references, not values)"
+        )
 
     name = args.endpoint_name or endpoint_name(args.uc_model)
     scale_to_zero = args.scale_to_zero == "true"

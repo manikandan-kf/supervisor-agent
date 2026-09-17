@@ -6,9 +6,15 @@
 # resources/ and is picked up by the `include` glob below, so adding a resource
 # is a new file rather than another hundred lines here:
 #
-#   resources/schema.yml      the Unity Catalog schema this environment owns
 #   resources/deploy_job.yml  the job that registers, publishes and deploys
 #   resources/lakebase.yml    shared infrastructure — disabled, see the file
+#
+# The bundle deliberately owns ONLY the job. It does not own the Unity Catalog
+# schema: an owned schema is dropped with everything in it by `bundle destroy`,
+# including another project's models, and the common case is deploying into a
+# schema that already exists. Create it once by hand (DEPLOYMENT.md §4). A
+# workspace where this bundle really is the schema's sole owner adds
+# resources/schema.yml back — the five lines are in DEPLOYMENT.md §4.
 #
 # What the bundle does NOT own: the serving endpoint. deploy_agent.py creates
 # it imperatively — `databricks.agents.deploy()` by default, or the Model
@@ -102,6 +108,28 @@ variables:
       declaring one that does not exist fails the model registration. One
       instance serves every environment — they are separated by lakebase_schema.
     default: supervisor-memory
+  lakebase_project:
+    description: >-
+      Lakebase Autoscaling PROJECT, for a workspace that has a project rather
+      than a provisioned instance. Set this OR lakebase_instance, not both —
+      the runtime resolves the project first. A project cannot be declared as
+      a model resource (the MLflow resource type names an instance), so a
+      deployment on this form also needs endpoint_secret_scope below.
+    default: ""
+  lakebase_branch:
+    description: >-
+      Branch inside lakebase_project. Empty uses the project's default branch.
+      Environments are still separated by lakebase_schema, not by branch.
+    default: ""
+  endpoint_secret_scope:
+    description: >-
+      Databricks secret scope holding DATABRICKS_HOST, DATABRICKS_CLIENT_ID and
+      DATABRICKS_CLIENT_SECRET for the SERVING CONTAINER. Stamped onto the
+      endpoint as {{secrets/<scope>/<key>}} references, never values. Needed
+      only where no Lakebase resource can be declared — with a declared
+      instance the endpoint gets its own short-lived credential and this stays
+      empty. DEPLOYMENT.md §6a.
+    default: ""
   lakebase_schema:
     description: >-
       Postgres schema inside the instance that this environment owns. Created
@@ -117,6 +145,14 @@ variables:
       Switch to 'serving-api' in a workspace where agents.deploy() fails
       (Agent Framework registration or the AI Gateway check at create time).
     default: agents
+  deploy_wait_minutes:
+    description: >-
+      How long the deploy task blocks waiting for the endpoint to report READY,
+      failing the job if it does not. 0 returns as soon as the rollout is
+      initiated — which makes `bundle run` succeed while the endpoint may still
+      be crash-looping, so a target that people deploy by hand sets a real
+      budget here.
+    default: "0"
   platform_schema:
     description: >-
       The platform-wide schema shared by EVERY agent — not an environment
@@ -167,9 +203,42 @@ targets:
     # and, because the endpoint name derives from the model's full name,
     # silently rename the endpoint. Two developers sharing one workspace pass
     # separate `--var schema=` and `--var lakebase_schema=` values instead.
+    workspace:
+      # Pins the target to one workspace, so a stray CLI profile cannot deploy
+      # dev somewhere else.
+      host: https://adb-7405616085045939.19.azuredatabricks.net
     variables:
-      routing_llm_endpoint: databricks-claude-sonnet-4-5
+      catalog: ips_uc_devops_enable
+      # The UC schema already exists and is not owned by this bundle; see the
+      # note above `include:` for why the bundle owns only the job.
+      schema: ips_agent_modernization
+      # The wheel volume lands in the same existing schema rather than a new
+      # `agent_platform` the bundle would have to create. Move it to a
+      # dedicated schema when a second agent starts consuming the wheel.
+      platform_schema: ips_agent_modernization
+      # Gemma is a completion model. Both governance calls use
+      # with_structured_output(), so this endpoint MUST support tool calling or
+      # every turn fails closed. Verify before deploying.
+      routing_llm_endpoint: databricks-gemma-3-12b
       workers: simulated
+      # agents.deploy() fails in this workspace; create the endpoint through the
+      # Model Serving SDK instead — same endpoint name, same tracing.
+      deploy_method: serving-api
+      # This workspace has a Lakebase *project/branch*, not a provisioned
+      # instance, and the MLflow resource type names an instance — so no
+      # Lakebase resource is declared and the address travels as job-task
+      # parameters instead.
+      lakebase_instance: ""
+      lakebase_project: ips-supervisor-agent-dev
+      lakebase_branch: production
+      # Consequence of the line above: with no declared resource the container
+      # has no minted credential, so it authenticates as the service principal.
+      # The scope must hold DATABRICKS_HOST, DATABRICKS_CLIENT_ID and
+      # DATABRICKS_CLIENT_SECRET; only references reach the endpoint.
+      endpoint_secret_scope: ips_agent_modernization
+      # Block until the endpoint is READY, so `bundle run` failing means the
+      # deployment failed. Container build plus first boot is 10–15 minutes.
+      deploy_wait_minutes: "40"
 
   prod:
     mode: production

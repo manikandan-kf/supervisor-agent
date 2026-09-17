@@ -17,11 +17,17 @@ in `databricks.yml` and no other change.
 **Where the bundle configuration lives.** `databricks.yml` holds what is true
 for the whole bundle: the variables, the library artifact, the sync set and the
 targets. Each resource is its own file under `resources/`, merged in by an
-`include: resources/*.yml` glob — `schema.yml` (the environment's Unity Catalog
-schema), `deploy_job.yml` (the four-task job) and `lakebase.yml` (shared
-infrastructure, shipped disabled; the file says why). Adding a resource is a new
-file there, not another block in `databricks.yml`; removing one is deleting its
-file.
+`include: resources/*.yml` glob — `deploy_job.yml` (the four-task job) and
+`lakebase.yml` (shared infrastructure, shipped disabled; the file says why).
+Adding a resource is a new file there, not another block in `databricks.yml`;
+removing one is deleting its file.
+
+**The bundle owns the job and nothing else.** In particular it does not own the
+Unity Catalog schema. A bundle that owns a schema drops it — with every model,
+table and volume in it, including another project's — on `bundle destroy`, and
+the common case is deploying into a schema that already exists and is shared.
+§4 creates it by hand in one command, and §4 also carries the resource
+definition for the rarer case where this bundle really is its sole owner.
 
 `dev` is a deployment, not a mode: it is held to the same runtime contract as
 prod — durable state or refuse to boot, no safety-critical setting disabled,
@@ -77,7 +83,7 @@ the Lakebase instance and the platform schema, which are shared.
 
 | Object | Name | Created by |
 |---|---|---|
-| Unity Catalog schema | `<catalog>.supervisor_<env>` | `bundle deploy` |
+| Unity Catalog schema | `<catalog>.supervisor_<env>` | **one CLI command you run once, before the first deploy** (§4a). It is deliberately not a bundle resource — a bundle that declares a schema also deletes it, with every table and model in it, on `bundle destroy` |
 | Job | `supervisor-agent-deploy` | `bundle deploy` |
 | Shared library wheel | `agent_governance-<version>-py3-none-any.whl` | `bundle deploy` (built locally, uploaded with the bundle) |
 | MLflow experiment | `/Shared/supervisor-agent-<env>` | the job |
@@ -136,6 +142,73 @@ databricks service-principal-secrets-proxy create <scim-id>
 The secret is shown **once**. Record it in your secret store. Put the
 application id and secret wherever the calling application reads its credentials from.
 
+### 4a. The Unity Catalog schema
+
+The bundle does not create it (see §1 — an owned schema is dropped with
+everything in it by `bundle destroy`). One command, once per environment:
+
+```
+databricks schemas create supervisor_dev <catalog> --comment "Supervisor Agent — model, prompts, governed configuration."
+databricks schemas get <catalog>.supervisor_dev
+```
+
+Deploying into a schema that already exists — the common case — is nothing at
+all: skip this and make sure the deploying identity holds `USE SCHEMA`,
+`CREATE TABLE`, `CREATE FUNCTION`, `CREATE MODEL` and `CREATE VOLUME` on it.
+
+#### Why the schema is not a bundle resource
+
+Bundles *can* declare one. The Databricks documentation is explicit about what
+that means: a schema declared under `resources` is a fully managed resource, and
+**destroying the bundle deletes the schema along with all of its contents** —
+tables, views, functions, models. There is no confirmation step that
+distinguishes "this schema was empty" from "this schema held another team's
+data".
+
+So the rule this repo follows is: the bundle owns what it can safely recreate
+(the job), and not the container everything else lives in. That is a choice
+about blast radius, not a limitation of bundles.
+
+If you do want the bundle to manage it — a workspace where this bundle is the
+schema's sole owner — there are three supported shapes, in increasing order of
+how much you are trusting yourself:
+
+1. **Declare it and protect it.** Add `resources/schema.yml` back and give it a
+   lifecycle guard, so `bundle destroy` refuses instead of dropping it:
+
+   ```yaml
+   resources:
+     schemas:
+       supervisor_schema:
+         catalog_name: ${var.catalog}
+         name: ${var.schema}
+         comment: Supervisor Agent — model, prompts, governed configuration.
+         lifecycle:
+           prevent_destroy: true
+   ```
+
+2. **Adopt an existing schema instead of creating one.** Declare it as above,
+   then bind the declaration to the schema that already exists, once per target:
+
+   ```
+   databricks bundle deployment bind supervisor_schema <catalog>.<schema> -t dev
+   ```
+
+   `bundle deploy` then updates the existing schema rather than failing with
+   *already exists*. Note what binding does **not** change: a bound resource is
+   still deleted by `bundle destroy`, so pair it with `prevent_destroy`.
+   `databricks bundle deployment unbind supervisor_schema` releases it again and
+   leaves the schema in the workspace.
+
+3. **Declare it in a separate, schema-only bundle** with a single deploying
+   identity. This is the usual answer when several developers deploy the same
+   bundle: schema names are global, bundle state is per deployment, and two
+   people deploying the same declared schema collide on it.
+
+Deploying into a schema that already exists and is shared — the case this repo
+ships for — needs none of that: create it (or don't, it's already there), grant
+the deploying identity, and let the bundle deploy the job.
+
 Pre-flight, before going further:
 
 ```
@@ -175,10 +248,21 @@ Physical isolation instead of schema isolation is a second instance plus
 > is the first thing to remove in a non-permanent environment
 > (`databricks database delete-database-instance supervisor-memory`).
 
-If your workspace creates Autoscaling-generation instances (project/branch
-rather than a provisioned instance), set `LAKEBASE_AUTOSCALING_ENDPOINT` or
-`LAKEBASE_PROJECT` / `LAKEBASE_BRANCH` in the deploy shell instead of relying
-on `LAKEBASE_INSTANCE`; `deploy_agent.py` passes them to the container.
+**Autoscaling generation (project/branch) instead of a provisioned instance.**
+Set `lakebase_project` and `lakebase_branch` on the target, and leave
+`lakebase_instance` empty. The job passes them to `publish_config.py` and
+`deploy_agent.py` as `--lakebase-project` / `--lakebase-branch`, and the deploy
+stamps `LAKEBASE_PROJECT` / `LAKEBASE_BRANCH` onto the endpoint. They are flags
+rather than inherited environment variables because a serverless job task can
+pass parameters and cannot set environment variables — there is no
+`spark_env_vars` outside a real cluster. Running a script by hand instead, the
+same two variables in the shell do the same job.
+
+Two consequences worth stating plainly. A project **cannot be declared as a
+model resource** — `DatabricksLakebase` names an instance — so the endpoint
+gets no minted per-resource credential and must authenticate as a service
+principal: see `endpoint_secret_scope` in §6a. And `LAKEBASE_AUTOSCALING_ENDPOINT`,
+if set in the deploy shell, still wins over both forms.
 
 ---
 
@@ -186,7 +270,7 @@ on `LAKEBASE_INSTANCE`; `deploy_agent.py` passes them to the container.
 
 ```
 databricks bundle validate -t dev     # → Validation OK!
-databricks bundle deploy   -t dev     # builds the library wheel, uploads files, creates the UC schema and the job
+databricks bundle deploy   -t dev     # builds the library wheel, uploads files, creates the job
 databricks bundle run supervisor_agent_deploy -t dev
 ```
 
@@ -262,8 +346,12 @@ databricks bundle run supervisor_agent_deploy -t dev
 ```
 
 By hand: `python deploy/deploy_agent.py … --deploy-method serving-api`.
-Add `--wait-minutes 40` to make the job block until the endpoint is `READY`
-and fail if it is not, instead of returning when the rollout is initiated.
+`--wait-minutes` makes the deploy block until the endpoint is `READY` and fail
+if it is not, instead of returning when the rollout is initiated; the job passes
+it from the `deploy_wait_minutes` variable, which defaults to `0`. A target
+people deploy by hand should set a real budget (40 covers a container build),
+so that a green `bundle run` means a serving endpoint rather than an initiated
+rollout.
 
 **What the switch does not fix.** An error of the form
 *"PERMISSION_DENIED: Endpoint creator doesn't have permission to access
@@ -271,8 +359,33 @@ dependency type: LAKEBASE"* comes from Model Serving validating the model's
 declared resources and is raised by both methods. Databricks currently accepts
 the passthrough for a Lakebase dependency only when the identity creating the
 endpoint is a **workspace admin** — run the job as one, or deploy with
-`--lakebase-instance ""` and provide the database credentials through the
-endpoint's environment instead.
+`--lakebase-instance ""` and give the container the service principal's own
+credentials instead.
+
+**The fallback, `--endpoint-secret-scope <scope>`.** Put `DATABRICKS_HOST`,
+`DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET` in a Databricks secret
+scope under exactly those key names, then set `endpoint_secret_scope` on the
+target. `deploy_agent.py` stamps `{{secrets/<scope>/<key>}}` **references** onto
+the endpoint — never values, which would be readable by anyone with CAN_VIEW on
+it — and the container's SDK resolves them at boot. The flag exists because the
+alternative does not work: setting those three as real environment variables
+would break the deploying process's own workspace calls, and a job task cannot
+set them at all. A scope named here wins over any literal in the deploy shell,
+so a shell holding a real secret cannot leak it onto the endpoint.
+
+This is a downgrade, not a preference: the container then acts as one static
+principal for every SDK call instead of holding a short-lived credential per
+resource, and the secret is rotated by hand. Give that principal only what this
+agent needs, and drop the scope once a declared resource is possible.
+
+**The scope is its own security boundary.** A secret scope is not a Unity
+Catalog object; it carries its own ACL, and `READ` on it returns the client
+secret in full through the API. Check it with `databricks secrets list-acls
+<scope>` and keep it to the deploying group. One constraint on how far you can
+lock it: Model Serving resolves the references **as the identity that created
+or last updated the endpoint**, so that identity must keep `READ` for as long as
+the endpoint runs — a deactivated deployer means the next rollout starts with no
+credentials.
 
 ---
 
@@ -282,6 +395,33 @@ Three grants, for three different identities. A recreated endpoint comes with
 a default ACL whichever method created it, so **redo these after any
 teardown-and-rebuild.**
 All three are **per environment**.
+
+### What governs what — and where Unity Catalog does and does not apply
+
+Unity Catalog governs data assets: tables, models, functions, volumes, prompts.
+It is not the authorization system for compute, for secrets, or for an external
+database engine — those enforce access where the request lands, which is
+somewhere UC never sees. The table below is the whole picture, so the recurring
+question ("shouldn't this be in UC?") has one answer per row.
+
+| Asset | Under UC? | What enforces access | Required |
+|---|---|---|---|
+| Registered model, prompts, trace tables, library volume | **Yes** | UC privileges | §7c, §7d |
+| Lakebase state — checkpoints, memory, `supervisor_config`, `supervisor_audit_log` | **Reads yes, writes no** | Postgres roles and grants; UC on the registered read-only catalog | §7b **mandatory**, §7f recommended |
+| Serving endpoint | **No — not possible** | Endpoint ACL (CAN QUERY / CAN MANAGE) | §7a |
+| Secret scope | **No — not possible** | Secret scope ACL (READ / WRITE / MANAGE) | §6a |
+| Deploy job, MLflow experiment | **No — not possible** | Workspace object ACLs | Default (creator only) is correct; widen deliberately |
+
+Three of those five *cannot* be moved under UC — there is no UC object type for
+a serving endpoint, a secret scope or a job, on any Databricks workspace. The
+one that is a choice is Lakebase, and §7f takes the half of it that is
+available: a read-only UC catalog over the database, so analysts and auditors
+read conversation state and the audit trail under UC permissions, lineage and
+audit logs. The write path stays Postgres because the agent is a Postgres
+client; §7b is what governs it, and it is not optional.
+
+So nothing here is waiting to be "moved into UC". What is required is that each
+enforcement point is actually configured — which is the rest of this section.
 
 ### 7a. Caller SP → CAN QUERY on the endpoint
 
@@ -393,6 +533,75 @@ caller is the right place for them (solution §04, §05):
 | Validate the payload and resolve the target agent | Malformed requests are rejected with a 4xx before they reach the graph |
 | Rate-limit per user and per API key | AI Gateway rate limits are not available on agent endpoints; the caller sees every user |
 | **Send one turn per conversation at a time** | Model Serving runs concurrent requests on any replica with no session affinity. Two turns on one `conversation_id` in flight together would both load the same checkpoint and the second write wins. The caller holds a turn until the previous one for that conversation has returned |
+
+---
+
+### 7f. Lakebase under Unity Catalog governance
+
+Everything this agent registers in Unity Catalog — the model, the prompts, the
+trace tables, the volume — is governed by UC privileges. Its *operational
+state* is not: conversation checkpoints, long-term memory, `supervisor_config`
+and `supervisor_audit_log` live in Lakebase Postgres, and the agent reaches them
+as a Postgres client. What constrains the agent there is §7b, not UC.
+
+Registering the Lakebase database as a Unity Catalog catalog closes the half of
+that gap that matters for everyone who is not the agent: analysts, auditors and
+dashboards then read the audit trail and conversation state through UC, with UC
+permissions, lineage and audit logs, instead of through a Postgres role someone
+had to be handed.
+
+**Be precise about what this does and does not do.** The registered catalog is
+**read-only** — it cannot modify the database, and it does not put the agent's
+writes under UC. The write path stays exactly what §7b makes it: one service
+principal, `SELECT` on the config table, `INSERT`/`SELECT` on the audit log.
+That is the correct end state, not a compromise: reads governed centrally,
+writes reduced to a single least-privileged identity.
+
+**Prerequisites:** `CREATE CATALOG` on the metastore, and a **Serverless** SQL
+warehouse — Pro and Classic warehouses return `PERMISSION_DENIED` on these
+catalogs.
+
+**UI:** app switcher → *Analytics and AI* → Catalog Explorer → **+** →
+*Create a catalog* → name it → type **Lakebase Postgres** → **Autoscaling** →
+select the project, branch and Postgres database → *Create*. (For a provisioned
+instance, choose that option instead of Autoscaling.)
+
+**REST**, if you would rather script it — one long-running operation, poll the
+returned `name` until `done: true`:
+
+```
+curl -X POST "$DATABRICKS_HOST/api/2.0/postgres/catalogs?catalog_id=supervisor_state" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"spec": {"postgres_database": "databricks_postgres",
+                "branch": "projects/<project>/branches/<branch>"}}'
+```
+
+The Python SDK equivalent is `w.postgres.create_catalog(...)`, which needs a
+recent `databricks-sdk`; the one pinned in `requirements.txt` is the serving
+container's, not your workstation's.
+
+Then grant read access the ordinary way, and keep it to the people who should
+see conversation content:
+
+```sql
+GRANT USE CATALOG ON CATALOG supervisor_state TO `<group>`;
+GRANT SELECT       ON CATALOG supervisor_state TO `<group>`;
+```
+
+After which the audit trail is a normal UC query:
+
+```sql
+SELECT decision, agent_id, user_id, created_at
+  FROM supervisor_state.supervisor_dev.supervisor_audit_log
+ WHERE created_at >= current_date - INTERVAL 7 DAYS;
+```
+
+Limitations worth knowing before you rely on it: one catalog per database, so
+register each separately; metadata is cached, so a new table may need a manual
+refresh in Catalog Explorer; and a branch created from an already-registered
+database inherits the parent's registration — registering that branch as its own
+catalog fails. Unregistering removes the catalog only; the database and every
+direct Postgres connection are untouched.
 
 ---
 
