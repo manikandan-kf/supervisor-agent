@@ -41,8 +41,8 @@ class GuardrailResult:
     # A SECOND, separate deliverable, offered back as a question after the first is dispatched.
     # Verbatim, so the follow-up screens it exactly as a fresh request.
     additional_request: str = ""
-    # A rule published with `action: escalate`: refused like a block, and handed to a reviewer with
-    # the conversation held, for requests a refusal alone under-reports. OWASP Agentic T10.
+    # A rule published with `action: escalate`: refused like a block, and recorded as an
+    # escalation for a reviewer, for requests a refusal alone under-reports. OWASP Agentic T10.
     escalate: bool = False
 
 

@@ -38,7 +38,8 @@ htmlcov/
 .mypy_cache/
 
 # Personal reference copies: a workspace-specific deploy walkthrough
-# (DEPLOYMENT.md is the tracked one) and the design documents the code is
-# written against. Both stay local.
+# (DEPLOYMENT.md is the tracked one), a knowledge-transfer walkthrough of
+# every file, and the design documents the code is written against.
 DEPLOY-RUNBOOK.md
+KT-GUIDE.md
 updated-technical-solution/

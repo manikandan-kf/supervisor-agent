@@ -11,9 +11,10 @@
 # secrets and infrastructure detail).
 #
 # Each rule is {pattern, reason, action?}. `action` is `block` (the default:
-# refuse with the reason; final) or `escalate` (refuse AND hand the
-# conversation to a human reviewer, holding it until they respond — for the
-# requests where a refusal alone under-reports what happened).
+# refuse with the reason; final) or `escalate` (refuse, and record the turn as
+# `escalated` in the decision trail for a human reviewer — for the requests
+# where a refusal alone under-reports what happened). Either way the refusal
+# is final and the conversation continues.
 global_deny_patterns:
   - pattern: "(?i)ignore\\s+(all\\s+)?(previous|prior|above)\\s+instructions"
     reason: the request looks like a prompt-injection attempt
@@ -180,8 +181,8 @@ output_deny_patterns:
 # ── Output policy: what happens to each category of sensitive finding ──────
 # Consumed by output_guard.OutputPolicy. Actions: allow | mask | block |
 # escalate. `mask` replaces the value with `[redacted:<label>]`; `block`
-# withholds the response with a governed message; `escalate` withholds it AND
-# opens a human review, holding the conversation.
+# withholds the response with a governed message; `escalate` withholds it and
+# records the turn as `escalated` for a human reviewer.
 #
 # Defaults mirror the tiers Google DLP, AWS Bedrock Guardrails and Databricks
 # detect_sensitive_data agree on: the high tier (credentials, national
