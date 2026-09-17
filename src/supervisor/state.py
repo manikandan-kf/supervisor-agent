@@ -54,8 +54,16 @@ class SupervisorState(TypedDict, total=False):
     # Layer 6 anomaly signal; at the limit the conversation is escalated, not refused.
     guardrail_block_streak: int
     # Staged artifact awaiting sign-off. The pause is a LangGraph `interrupt()`, so
-    # the graph genuinely suspends.
+    # the graph genuinely suspends. Carries `staged_at`, the gate's own clock for the
+    # approval-turnaround KPI (solution §07).
     pending_approval: Optional[dict]
+    # A decision the RBAC gate read out of the conversation ("approve", "reject: …"). Set and
+    # consumed within one turn; present means the approval node must not suspend again.
+    approval_reply: Optional[dict]
+    # The most recent sign-off, kept until the next dispatch relays it to the worker: a worker
+    # whose own workflow gates HLD → LLD → Epic (solution §02) has no other way to learn that
+    # its staged stage was approved, because the decision never travels as a chat message.
+    last_signoff: Optional[dict]
 
     # ISO-8601 UTC, not monotonic: it is checkpointed. Rewritten only when an
     # expiry restarts the session.

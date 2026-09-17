@@ -25,11 +25,13 @@ WORKER_UNAVAILABLE_MESSAGE = (
     "The agent is temporarily unavailable. Please try again in a few minutes — "
     "your conversation has been kept."
 )
-# Only approve / reject / comment are accepted while a gate is open; anything
-# else is refused with an explanation, never merged into the pending stage.
+# Only approve / reject / comment are accepted while a gate is open; anything else is
+# refused with an explanation, never merged into the pending stage. The words are named
+# because a caller with no approval controls of its own has no other way to answer the gate.
 APPROVAL_PENDING_MESSAGE = (
-    "A staged draft is still waiting for a decision. Please approve or reject it "
-    "first — your message has not been sent to the agent."
+    "A staged draft is still waiting for a decision. Reply **approve** or **reject** — "
+    "add a note after the word if you want it recorded — and I'll take it from there. "
+    "Your message has not been sent to the agent."
 )
 # Solution §05: an unreachable guardrail model fails *closed* — held, never an implicit
 # pass. Worded as a hold, not a refusal: nothing was judged, and "I can't help

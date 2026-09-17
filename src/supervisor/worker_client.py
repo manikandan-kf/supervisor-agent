@@ -86,6 +86,8 @@ class WorkerClient(Protocol):
         # The turn's remaining time budget (solution §05). Part of the protocol because the
         # dispatch stage always passes it; a conforming client without it would TypeError.
         deadline=None,
+        # The sign-off a human gave on this worker's previous stage, when there is one.
+        signoff=None,
     ) -> WorkerResponse: ...
 
 
@@ -135,6 +137,7 @@ class ModelServingWorkerClient:
         user_role,
         trace,
         deadline=None,
+        signoff=None,
     ) -> WorkerResponse:
         """One governed dispatch, retried with backoff behind a circuit breaker.
 
@@ -145,6 +148,10 @@ class ModelServingWorkerClient:
             "conversation_id": conversation_id,
             "user_role": user_role,
             "context": context,
+            # A worker that gates its own stages (HLD → LLD → Epic) learns here that the
+            # previous one was signed off, and by whom — the decision reaches the supervisor
+            # as a control message, never as a turn in the conversation it can read.
+            **({"signoff": signoff} if signoff else {}),
             # Correlation fields travel with every request so one user action stitches
             # together across caller, supervisor and worker (solution §08 tracing).
             **{k: v for k, v in (trace or {}).items() if v},
@@ -299,13 +306,15 @@ class SimulatedWorkerClient:
         user_role,
         trace,
         deadline=None,
+        signoff=None,
     ) -> WorkerResponse:
         # Checked, not ignored: the simulation makes a real model call and can overrun like
         # a live dispatch — a mock exempt from the budget would hide what it exists to catch.
         if deadline is not None:
             deadline.ensure(f"simulating {agent.id}")
-        # `trace` is accepted and ignored — nothing leaves the process — so the swap to the
-        # real client stays a config change.
+        # `trace` and `signoff` are accepted and ignored — nothing leaves the process, and a
+        # simulation has no staged workflow to continue — so the swap to the real client stays
+        # a config change.
         rules = get_prompt(_SIMULATION_PROMPT_NAME).format(
             agent_name=agent.name,
             domain_scope=" ".join(agent.domain_scope.split()),

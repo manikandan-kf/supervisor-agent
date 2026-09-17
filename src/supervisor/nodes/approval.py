@@ -16,6 +16,7 @@ from ..state import SupervisorContext
 from .base import (
     NodeBase,
     _now_iso,
+    _seconds_since,
     _trail,
 )
 
@@ -59,7 +60,9 @@ class ApprovalMixin(NodeBase):
         owner_id = pending.get("agent_id", "")
         owner_name = pending.get("agent_name", "") or owner_id
 
-        decision = interrupt(
+        # A decision the RBAC gate read out of the conversation settles the gate without
+        # suspending: `interrupt()` here would re-open the gate the reviewer just answered.
+        decision = state.get("approval_reply") or interrupt(
             {
                 "kind": "worker_approval",
                 "agent_id": owner_id,
@@ -73,9 +76,12 @@ class ApprovalMixin(NodeBase):
             }
         )
 
-        approved = decision is True or (
-            isinstance(decision, dict) and decision.get("decision") == "approved"
+        # Both spellings are accepted: callers send "approved", people type "approve".
+        # Anything else — including a malformed payload — is a rejection, which widens nothing.
+        stated = (
+            str(decision.get("decision", "")).strip().lower() if isinstance(decision, dict) else ""
         )
+        approved = decision is True or stated in ("approved", "approve", "accept", "accepted")
         comment = decision.get("comment", "") if isinstance(decision, dict) else ""
 
         # ── Who approved what, and when ───────────────────────────────────────
@@ -84,12 +90,20 @@ class ApprovalMixin(NodeBase):
         # subject never reaches the supervisor.
         approver = context.user_key or "unattributed"
         decided_at = _now_iso()
+        # Solution §07 KPI, "HITL approval turnaround": how long the artifact waited at the
+        # gate. Measured from `staged_at`, stamped by dispatch — a reviewer may answer days
+        # later, so the turn's own latency says nothing about it.
+        staged_at = pending.get("staged_at", "")
+        waited = _seconds_since(staged_at, "pending_approval.staged_at")
+        waited_note = f" after {waited:.0f}s at the gate" if waited is not None else ""
         signoff = {
             "stage": stage,
             "agent_id": owner_id,
             "approver": approver,
             "approver_role": context.user_role,
             "decided_at": decided_at,
+            "staged_at": staged_at,
+            "waited_seconds": round(waited, 3) if waited is not None else None,
             "comment": comment[:2000],
         }
         if approved and approver == "unattributed":
@@ -107,6 +121,7 @@ class ApprovalMixin(NodeBase):
                 goto="respond",
                 update={
                     # The gate stays open: nothing was decided.
+                    "approval_reply": None,
                     "outcome": "blocked",
                     "final_text": (
                         f"I can't record who is approving this, so the {stage} draft "
@@ -130,6 +145,7 @@ class ApprovalMixin(NodeBase):
                 goto="respond",
                 update={
                     "pending_approval": None,
+                    "approval_reply": None,
                     "outcome": "blocked",
                     "final_text": (
                         f"You don't have permission to approve the {owner_name}'s work. "
@@ -151,6 +167,10 @@ class ApprovalMixin(NodeBase):
                 goto="respond",
                 update={
                     "pending_approval": None,
+                    "approval_reply": None,
+                    # Relayed to the worker on the next dispatch: its own workflow gated this
+                    # stage, and a rejection is what tells it to rework rather than continue.
+                    "last_signoff": {**signoff, "decision": "rejected"},
                     # Stays "answer" on purpose: a rejection is audited via `signoff`, not a new
                     # outcome value — the routing-completion KPI is computed from
                     # `outcome == "answer"`, and a signed-off artifact *is* a completed routing.
@@ -165,7 +185,7 @@ class ApprovalMixin(NodeBase):
                         "approval",
                         "rejected",
                         f"stage {stage} of '{owner_id}' rejected by {approver} "
-                        f"(role {context.user_role or 'unknown'}) at {decided_at}"
+                        f"(role {context.user_role or 'unknown'}) at {decided_at}{waited_note}"
                         + (f"; note: {comment}" if comment else ""),
                     ),
                 },
@@ -175,6 +195,10 @@ class ApprovalMixin(NodeBase):
             goto="respond",
             update={
                 "pending_approval": None,
+                "approval_reply": None,
+                # Relayed to the worker on the next dispatch, so a workflow that gates
+                # HLD → LLD → Epic can continue from the stage a human just signed off.
+                "last_signoff": {**signoff, "decision": "approved"},
                 "worker_response": {"status": "approved", "stage": pending.get("stage")},
                 "outcome": "answer",
                 "signoff": {**signoff, "decision": "approved"},
@@ -184,7 +208,7 @@ class ApprovalMixin(NodeBase):
                     "approval",
                     "approved",
                     f"stage {stage} of '{owner_id}' approved by {approver} "
-                    f"(role {context.user_role or 'unknown'}) at {decided_at}"
+                    f"(role {context.user_role or 'unknown'}) at {decided_at}{waited_note}"
                     + (f"; note: {comment}" if comment else ""),
                 ),
             },

@@ -292,6 +292,47 @@ def followup_answer(text: str) -> str:
     return ""
 
 
+# ── Answering an open approval gate ─────────────────────────────────────────
+#
+# Solution §05 ("input during an open approval gate") accepts approve / reject / comment while
+# a gate is open. A caller that can send a `resume` payload uses that; this is the same decision
+# typed into the conversation, which is the only way to sign off from a plain chat surface.
+# Deterministic and anchored at the start, like `followup_answer` — a model is never asked
+# whether something was an approval.
+_APPROVES_GATE = re.compile(
+    r"^\W*(?:approve(?:d)?|approval|accept(?:ed)?|lgtm|looks\s+good|sign(?:ed)?[-\s]?off|"
+    r"go\s+ahead|proceed|ship\s+it)\b",
+    re.IGNORECASE,
+)
+# Plain "no" rejects but plain "yes" does not approve, deliberately: declining to act widens
+# nothing, while a sign-off is a privilege and deserves the word.
+_REJECTS_GATE = re.compile(
+    r"^\W*(?:reject(?:ed)?|decline(?:d)?|no|nope|nah|don'?t\s+approve|do\s+not\s+approve|"
+    r"not\s+approve(?:d)?|discard|cancel|needs?\s+(?:changes|work|rework)|rework)\b",
+    re.IGNORECASE,
+)
+
+
+def approval_reply(text: str) -> Optional[dict]:
+    """`{"decision": "approved"|"rejected", "comment": ...}` for a message that answers an
+    open approval gate, or None when it does not.
+
+    A message that also names a deliverable is not a decision: "approve and now write the LLD"
+    is a new request, and merging it into the staged artifact is exactly what §05 forbids.
+    """
+    message = (text or "").strip()
+    if not message or _NAMES_A_DELIVERABLE.search(message):
+        return None
+    for decision, pattern in (("rejected", _REJECTS_GATE), ("approved", _APPROVES_GATE)):
+        match = pattern.match(message)
+        if match:
+            # Whatever follows the word is the reviewer's note — it travels with the
+            # sign-off into the audit row, so it is bounded like any other stored text.
+            comment = message[match.end() :].strip(" \t\r\n-–—:;,.")
+            return {"decision": decision, "comment": comment[:2000]}
+    return None
+
+
 def _second_request(verdict: "GuardrailVerdict") -> str:
     """The second deliverable in the message, if the verdict found one.
 

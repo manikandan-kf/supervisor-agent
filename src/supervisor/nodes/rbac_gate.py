@@ -14,6 +14,7 @@ from agent_governance.rbac import DENIED_MESSAGE
 from langgraph.runtime import Runtime
 from langgraph.types import Command
 
+from ..guardrail_engine import approval_reply
 from ..state import SupervisorContext
 from ..user_facing_text import (
     APPROVAL_PENDING_MESSAGE,
@@ -126,6 +127,8 @@ class RbacGateMixin(NodeBase):
             # Cleared every turn: a stale sign-off would make the *next* turn look like a
             # governance decision and re-audit an approval that already happened.
             "signoff": None,
+            # A decision read out of the conversation belongs to the turn that carried it.
+            "approval_reply": None,
             # Stamped on the first turn only: plain-str channels do not merge, and re-stamping
             # would keep every session perpetually young. The *activity* clock restamps every turn.
             "session_started_at": state.get("session_started_at") or _now_iso(),
@@ -199,8 +202,32 @@ class RbacGateMixin(NodeBase):
             return expired
 
         if state.get("pending_approval"):
-            # A normal message arrived while a staged artifact awaits sign-off. Only approve/
-            # reject/comment are accepted while a gate is open; it is never merged into the stage.
+            # Only approve / reject / comment are accepted while a gate is open (solution §05).
+            # A decision typed into the conversation settles the gate here — the caller may have
+            # no way to send a `resume` payload — and the approval node then does not suspend.
+            decision = approval_reply(inbound)
+            if decision is not None:
+                return Command(
+                    goto="approval",
+                    update={
+                        **reset,
+                        "target_agent_id": agent_id,
+                        "rbac": {"allowed": True, "reason": reason},
+                        "approval_reply": decision,
+                        "audit_trail": [
+                            _entry("rbac_gate", "allow", reason),
+                            _entry(
+                                "approval_gate",
+                                "decision_received",
+                                f"{decision['decision']} in the conversation — the gate was "
+                                "settled without a resume payload",
+                            ),
+                        ],
+                    },
+                )
+
+            # Anything else is out of turn: refused with an explanation, never merged
+            # into the pending stage.
             return Command(
                 goto="approval",
                 update={

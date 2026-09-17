@@ -356,6 +356,98 @@ def test_approval_succeeds_when_the_producing_agent_is_approvable(make_graph):
     assert settled["final_text"] == "Here is the HLD draft."
 
 
+# ── Answering the gate from the conversation (solution §05) ──────────────────
+
+
+def _staged(make_graph, answer="Here is the LLD draft."):
+    """A graph parked at an approval gate, with a second worker reply queued behind it."""
+    workers = StubWorkers(
+        [
+            WorkerResponse(text="Here is the HLD draft.", status="approval_pending", stage="HLD"),
+            WorkerResponse(text=answer),
+        ]
+    )
+    graph, services = make_graph(workers=workers)
+    return graph, services
+
+
+def test_a_typed_approval_settles_the_gate(make_graph):
+    """Only approve/reject/comment are accepted while a gate is open — and the decision may
+    arrive as a message, since a caller may have no way to send a `resume` payload."""
+    graph, services = _staged(make_graph)
+    invoke(graph, "Generate requirements for alpha", thread="gate-1")
+
+    settled = invoke(graph, "approve — checked with the release manager", thread="gate-1")
+
+    assert settled["outcome"] == "answer"
+    assert settled["final_text"] == "Here is the HLD draft."
+    assert settled["pending_approval"] is None
+    # The worker was not called again: the artifact came from the checkpoint.
+    assert len(services.workers.calls) == 1
+    signoff = services.audit.records[-1]["signoff"]
+    assert signoff["decision"] == "approved"
+    assert signoff["comment"] == "checked with the release manager"
+    assert signoff["approver"] == "user-1"
+
+
+def test_a_typed_rejection_discards_the_draft(make_graph):
+    graph, services = _staged(make_graph)
+    invoke(graph, "Generate requirements for alpha", thread="gate-2")
+
+    settled = invoke(graph, "reject: wrong product line", thread="gate-2")
+
+    assert "discarded" in settled["final_text"]
+    assert settled["pending_approval"] is None
+    assert services.audit.records[-1]["signoff"]["decision"] == "rejected"
+    assert len(services.workers.calls) == 1
+
+
+def test_a_request_during_an_open_gate_is_refused_not_merged(make_graph):
+    """A message that names a deliverable is a new request, not a decision — it is refused
+    with an explanation and the artifact stays staged."""
+    graph, services = _staged(make_graph)
+    invoke(graph, "Generate requirements for alpha", thread="gate-3")
+
+    result = invoke(graph, "approve and now write the LLD", thread="gate-3")
+
+    assert result["outcome"] == "approval_pending"
+    assert result["final_text"] == msg.APPROVAL_PENDING_MESSAGE
+    assert result["pending_approval"]["stage"] == "HLD"
+    assert len(services.workers.calls) == 1
+
+
+def test_the_signoff_records_how_long_the_artifact_waited(make_graph):
+    """Solution §07 KPI "HITL approval turnaround" — measured from the moment the gate
+    opened, which is the only clock a turn answering it days later can use."""
+    graph, services = _staged(make_graph)
+    staged = invoke(graph, "Generate requirements for alpha", thread="gate-4")
+    assert staged["pending_approval"]["staged_at"]
+
+    resume(graph, {"decision": "approved"}, thread="gate-4")
+
+    signoff = services.audit.records[-1]["signoff"]
+    assert signoff["staged_at"] == staged["pending_approval"]["staged_at"]
+    assert signoff["waited_seconds"] is not None and signoff["waited_seconds"] >= 0
+
+
+def test_the_next_dispatch_tells_the_worker_the_stage_was_signed_off(make_graph):
+    """The gate lives in the worker's own workflow (solution §02), and the decision never
+    reaches it as a chat message — so it travels with the next dispatch, once."""
+    graph, services = _staged(make_graph)
+    invoke(graph, "Generate requirements for alpha", thread="gate-5")
+    resume(graph, {"decision": "approved"}, thread="gate-5")
+
+    invoke(graph, "Now the LLD", thread="gate-5")
+    relayed = services.workers.calls[-1]["signoff"]
+    assert relayed["decision"] == "approved"
+    assert relayed["stage"] == "HLD"
+    assert relayed["agent_id"] == "requirement-agent"
+
+    # Consumed: the stage is signed off once, and a later dispatch must not re-announce it.
+    invoke(graph, "And the epics", thread="gate-5")
+    assert services.workers.calls[-1]["signoff"] is None
+
+
 def test_rejecting_needs_no_approve_permission(make_graph):
     """Declining to act is always available — only sign-off is a privilege."""
     workers = StubWorkers(

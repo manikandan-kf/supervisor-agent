@@ -36,6 +36,7 @@ from .base import (
     _entry,
     _excerpt,
     _latest_user_text,
+    _now_iso,
     _trail,
     _window,
     _worker_messages,
@@ -72,6 +73,12 @@ class DispatchMixin(FailsafesMixin):
             screened_context[key] = value
         resolved = screened_context
 
+        # The sign-off a human just gave, if any. The worker's own workflow is what gates a
+        # multi-stage deliverable (solution §02), and the decision never reaches it as a chat
+        # message, so it travels here once and is cleared after the call.
+        signoff = state.get("last_signoff")
+        consumed = {"last_signoff": None} if signoff else {}
+
         try:
             deadline.ensure(f"dispatch to {agent.id}")
             resp = self.s.workers.invoke(
@@ -90,6 +97,7 @@ class DispatchMixin(FailsafesMixin):
                     "pseudonymous_user_reference": context.user_key,
                 },
                 deadline=deadline,
+                signoff=signoff,
             )
         except BudgetExhausted as exc:
             return self._budget_exhausted(state, "dispatch", exc)
@@ -186,6 +194,7 @@ class DispatchMixin(FailsafesMixin):
             return Command(
                 goto="respond",
                 update={
+                    **consumed,
                     "pending_approval": None,
                     "worker_response": {"status": resp.status, "stage": resp.stage},
                     "outcome": "escalated",
@@ -208,6 +217,7 @@ class DispatchMixin(FailsafesMixin):
             return Command(
                 goto="respond",
                 update={
+                    **consumed,
                     "pending_approval": None,
                     "worker_response": {"status": resp.status, "stage": resp.stage},
                     "outcome": "blocked",
@@ -249,12 +259,16 @@ class DispatchMixin(FailsafesMixin):
             return Command(
                 goto="approval",
                 update={
+                    **consumed,
                     "pending_approval": {
                         "agent_id": agent.id,
                         "agent_name": agent.name,
                         "stage": stage,
                         "artifact": text,
                         "context": resolved,
+                        # When the gate opened — the approval-turnaround KPI (§07) measures
+                        # from here, not from the turn that answers it.
+                        "staged_at": _now_iso(),
                         # Shown to the approver so the reason for the gate travels with the
                         # artifact rather than living only in the audit row.
                         "required_because": mandated,
@@ -271,6 +285,7 @@ class DispatchMixin(FailsafesMixin):
             return Command(
                 goto="respond",
                 update={
+                    **consumed,
                     "pending_approval": None,
                     "outcome": "error",
                     "final_text": GENERIC_ERROR,
@@ -340,6 +355,7 @@ class DispatchMixin(FailsafesMixin):
         return Command(
             goto="respond",
             update={
+                **consumed,
                 "pending_approval": None,
                 **deferred_update,
                 "worker_response": {"status": resp.status, "stage": resp.stage},

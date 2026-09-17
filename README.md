@@ -32,7 +32,7 @@ worker:
 | `approvable_agents` | The worker ids this user may approve staged work for | Same |
 | `user_role`, `user_id` | The persona, for audit attribution, and a pseudonymous user reference for long-term memory | Never used for authorization |
 | `conversation_id` | The thread; the checkpointer keys on it | A new id starts a fresh conversation |
-| `resume` | `{"decision": "approve" | "reject", "comment": ...}` when answering an approval gate | Resumes the paused graph |
+| `resume` | `{"decision": "approved" | "rejected", "comment": ...}` when answering an approval gate | Resumes the paused graph. A caller with no approval controls can instead send **approve** / **reject** (with an optional note) as an ordinary message |
 
 Every turn then walks the fixed pipeline and ends in one of these outcomes,
 returned in `custom_outputs.outcome` beside the text:
@@ -42,7 +42,7 @@ returned in `custom_outputs.outcome` beside the text:
 | `answer` | A worker answered, the reply passed the output guard, here it is |
 | `blocked` | Access denied, off-domain, or the reply failed the output guard. Final |
 | `clarify` | The supervisor needs one detail before it can route; reply and it resumes |
-| `approval_pending` | A staged artifact is waiting for `resume` |
+| `approval_pending` | A staged artifact is waiting for a decision — a `resume` payload, or an **approve** / **reject** message |
 | `escalated` | The clarification cap, an `escalate` rule, a block streak or the output guard handed this to a human; it is recorded in the audit table |
 | `expired` | The conversation sat idle past the retention window; start again |
 | `error` | Nothing was judged: a model or the audit sink was unavailable, or the turn ran out of time. Retry |
@@ -125,7 +125,7 @@ not stated below.
 | `nodes/guardrails.py` | Stage 2. Runs the two-tier screen and answers small talk itself. A block is final; an `escalate` rule or a streak of blocks is recorded as an escalation | §02 "Guardrails" | Required |
 | `nodes/route.py` | Stage 3. Resolves the context the worker needs (session context first, long-term memory as a seed) or asks one clarifying question | §02 "Route / clarify" | Required |
 | `nodes/dispatch.py` | Stage 4. Calls the worker, screens the conversation on the way out and the reply on the way back, and stages an artifact for approval when required | §02 "Dispatch", §05 "Worker agent timeout" | Required |
-| `nodes/approval.py` | Stage 4b. The LangGraph `interrupt()` that pauses for human sign-off, in its own node so a resume does not re-call the worker; records who decided | §02 "Human-in-the-loop approval gates" | Required |
+| `nodes/approval.py` | Stage 4b. The LangGraph `interrupt()` that pauses for human sign-off, in its own node so a resume does not re-call the worker; records who decided, and how long the artifact waited at the gate (§07 KPI) | §02 "Human-in-the-loop approval gates", §05 "Input during an open approval gate" | Required |
 | `nodes/respond.py` | Stage 5. The single exit: writes the audit record (synchronously for governance decisions), then emits the answer | §02 "Response & audit" | Required |
 | `nodes/failsafes.py` | What any stage does when the turn's time budget is exhausted or the clarification cap is reached (escalate to a human) | §05 clarification cap, time budget | Required |
 | `guardrail_engine.py` | The two-tier screen itself: deterministic deny rules, then a semantic verdict per reachable agent; also the small-talk classifier | §03 "Full control of guardrail logic" | Required |
@@ -203,6 +203,10 @@ is one module or one setting to remove.
 - **Per-agent governance model** (`MULTI_MODEL_ENABLED`, `model:` in `agents.yaml`); ships dark. §06 describes one model per environment.
 - **Hash chain** on the audit table (`audit_trail.py`); §02 asks for admin-only audit tables, which the Postgres grants provide on their own.
 - **Kill switch** and **block-streak escalation** in the guardrails stage.
+- **Supervisor-enforced approval** (`approval_patterns` in `agents.yaml`): a request for
+  an irreversible action is staged for sign-off whether or not the worker asks for a gate
+  (§04 puts irreversible actions behind the gate; leaving it to the worker made the
+  promise rest on worker cooperation).
 
 Three things are deliberately **not** built.
 

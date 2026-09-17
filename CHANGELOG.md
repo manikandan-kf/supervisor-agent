@@ -86,6 +86,33 @@ solution does not ask for is gone. Shared library 0.2.0 → 0.3.0.
   `SESSION_NOTES_MAX` and `SESSION_NOTE_MAX_CHARS`. Setting one now has no
   effect; none is required.
 
+### Added
+
+- **A decision can answer an approval gate from the conversation.** Solution §05
+  accepts approve / reject / comment while a gate is open; until now only a
+  `resume` payload could settle one, which no plain chat surface — the AI
+  Playground included — can send. `guardrail_engine.approval_reply` parses
+  **approve** / **reject** (with an optional note after the word) exactly as
+  deterministically as the small-talk classifier, the RBAC gate hands the
+  decision to the approval node, and the node then records it without
+  suspending again. A message that names a deliverable is *not* a decision, so
+  "approve and now write the LLD" is still refused as out of turn rather than
+  merged into the staged artifact. The same authorization applies either way:
+  an approval still needs an attributable approver and `approvable_agents` for
+  the agent that produced the artifact.
+- **The approval gate is timed** (§07 KPI, "HITL approval turnaround").
+  `pending_approval.staged_at` is stamped when dispatch opens the gate, and the
+  sign-off record carries `staged_at` and `waited_seconds`, so the KPI is a
+  query over the audit table's `signoff` column. The turn's own latency could
+  never answer it: a reviewer may decide days later.
+- **The sign-off reaches the worker on the next dispatch.** §02 puts the
+  multi-stage gate (HLD → LLD → Epic) inside the worker's own workflow, but the
+  decision arrives at the supervisor as a control payload and never as a turn in
+  the conversation, so a worker had no way to learn its staged stage was
+  approved. The decision now travels once, as `custom_inputs.signoff` on the
+  next dispatch, and is cleared after that call. `WorkerClient.invoke` takes a
+  `signoff=None` keyword for it.
+
 ### Changed
 
 - Renamed so the file name says what the file is for. Supervisor: `agent.py` →
@@ -125,14 +152,17 @@ solution does not ask for is gone. Shared library 0.2.0 → 0.3.0.
 
 ### Tests
 
-- 260 tests, from 351. The 91 that went are the tests of the removed modules
+- 265 tests, from 351. The 91 that went are the tests of the removed modules
   and behaviours: `test_locking.py` and `test_review_queue.py` are gone,
   `test_audit.py` is now `test_audit_trail.py`, and the session-notes,
   grounding, streaming, spend and trust sections came out of the files that
   owned them. The tests that pinned the appeal path and the review hold were
   rewritten in place to pin what replaced them — a block is final, and an
   escalation is an audit row on a conversation that continues. No other test of
-  surviving behaviour changed.
+  surviving behaviour changed. Five new tests in `test_graph.py` cover the
+  approval-gate additions above: a typed approval and rejection, an out-of-turn
+  request during an open gate, the recorded wait, and the sign-off reaching the
+  next dispatch exactly once.
 
 ## [1.2.0] — 2026-09-15
 

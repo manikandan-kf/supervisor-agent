@@ -76,7 +76,17 @@ class StubWorkers:
         self.responses = list(responses or [WorkerResponse(text="worker answer")])
         self.calls = []
 
-    def invoke(self, agent, messages, context, conversation_id, user_role, trace, deadline=None):
+    def invoke(
+        self,
+        agent,
+        messages,
+        context,
+        conversation_id,
+        user_role,
+        trace,
+        deadline=None,
+        signoff=None,
+    ):
         self.calls.append(
             {
                 "agent": agent.id,
@@ -84,6 +94,8 @@ class StubWorkers:
                 "context": context,
                 "trace": trace,
                 "deadline": deadline,
+                # What the worker was told about a sign-off on its previous stage.
+                "signoff": signoff,
             }
         )
         return self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
