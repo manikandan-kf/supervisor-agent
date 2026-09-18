@@ -104,6 +104,8 @@ resources:
               - "${var.multi_model_enabled}"
               - "--deploy-method"
               - "${var.deploy_method}"
+              - "--scale-to-zero"
+              - "${var.scale_to_zero}"
               - "--wait-minutes"
               - "${var.deploy_wait_minutes}"
 

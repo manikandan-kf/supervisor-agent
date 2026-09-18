@@ -145,6 +145,15 @@ variables:
       Switch to 'serving-api' in a workspace where agents.deploy() fails
       (Agent Framework registration or the AI Gateway check at create time).
     default: agents
+  scale_to_zero:
+    description: >-
+      'true' lets the endpoint drop to zero replicas after about 30 minutes
+      with no traffic, and pay nothing while idle. The first request afterwards
+      pays a cold start — usually 10-20 seconds, sometimes minutes, with no SLA
+      — so this is a cost choice for an environment nobody is waiting on, not a
+      production setting. Databricks does not recommend it where capacity must
+      be guaranteed.
+    default: "false"
   deploy_wait_minutes:
     description: >-
       How long the deploy task blocks waiting for the endpoint to report READY,
@@ -239,6 +248,9 @@ targets:
       # Block until the endpoint is READY, so `bundle run` failing means the
       # deployment failed. Container build plus first boot is 10–15 minutes.
       deploy_wait_minutes: "40"
+      # dev idles overnight and at weekends; nobody is waiting on its first
+      # request. The cold start is the price, and it is the right trade here.
+      scale_to_zero: "true"
 
   prod:
     mode: production
@@ -252,6 +264,9 @@ targets:
       routing_llm_endpoint: databricks-claude-opus-4-5
       # Prod expects the real worker endpoints to exist.
       workers: live
+      # Stated rather than inherited: prod holds capacity. A cold start has no
+      # SLA, and the first caller after an idle period would pay it.
+      scale_to_zero: "false"
       # Schema separation (supervisor_prod) keeps dev and prod from sharing a
       # row. Set a dedicated instance here instead when prod needs its own
       # database — a separate failure domain and separate capacity:

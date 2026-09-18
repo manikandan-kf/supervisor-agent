@@ -387,6 +387,37 @@ or last updated the endpoint**, so that identity must keep `READ` for as long as
 the endpoint runs — a deactivated deployer means the next rollout starts with no
 credentials.
 
+### 6b. Scale to zero
+
+`scale_to_zero: "true"` on a target lets its endpoint drop to zero replicas
+after roughly 30 minutes without traffic, and cost nothing until the next
+request. `deploy_agent.py` passes it to both deploy methods, so the endpoint
+behaves the same whichever created it. The default is `"false"`.
+
+What you are trading, in Databricks' own terms: the first request after an idle
+period pays a **cold start** — usually 10–20 seconds, sometimes minutes, with
+**no SLA** — and capacity is not guaranteed while scaled to zero. The
+documentation recommends against it for production endpoints.
+
+Two interactions specific to this agent, worth knowing before turning it on:
+
+- **A cold start is a full boot.** The container loads the governed
+  configuration, resolves the prompt alias and opens a Lakebase pool before it
+  answers. In a deployed environment it *refuses to serve* rather than degrade,
+  so a cold start while Lakebase is unreachable is an error, not a slow answer.
+  With heavy initialisation it can also exceed the startup health-check window,
+  where the endpoint looks stuck rather than slow.
+- **It is invisible in `READY`.** An endpoint scaled to zero still reports
+  `READY`. Verify behaviour by sending a request, as §8 does, not by reading
+  state.
+
+Per environment, so a cheap dev and a warm prod are two lines, not two
+deployments:
+
+```
+databricks bundle deploy -t dev --var scale_to_zero=true
+```
+
 ---
 
 ## 7. Post-deploy grants — the part that is easy to miss

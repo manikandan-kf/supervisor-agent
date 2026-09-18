@@ -32,6 +32,15 @@ cannot set one.
   task cannot set them at all. A named scope wins over any literal in the
   deploy shell, so a shell holding a real secret cannot stamp it on the
   endpoint.
+- **`scale_to_zero`** bundle variable, passed to `deploy_agent.py
+  --scale-to-zero` (the flag already existed on both deploy methods; only the
+  bundle could not set it). `dev` turns it on — the endpoint drops to zero
+  replicas after ~30 minutes idle and costs nothing until the next request;
+  `prod` states `false`, because a cold start has no SLA and capacity is not
+  guaranteed while scaled to zero. DEPLOYMENT.md §6b covers the two
+  interactions that matter here: a cold start is a full boot (governed config,
+  prompt alias, Lakebase pool) and a deployed environment refuses to serve
+  rather than degrade, and an endpoint scaled to zero still reports `READY`.
 - **`deploy_wait_minutes`** bundle variable, passed to `deploy_agent.py
   --wait-minutes` (default `0`, unchanged). Set on a target, `bundle run`
   fails unless the endpoint reaches `READY` instead of succeeding when the
