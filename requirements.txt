@@ -18,25 +18,25 @@
 
 # 3.15+ for register_prompt(response_format=, model_config=) — the structured
 # output contract and run parameters ship with each prompt version.
-mlflow==3.15.1
+mlflow==3.16.1
 # 1.2+ for typed v2 streaming (agent.predict_stream) on top of the 1.0 APIs the
 # graph already depends on: Command destinations, Runtime context, RetryPolicy,
 # durability=, and the custom/messages stream modes the task plan uses.
 langgraph==1.2.11
-langchain-core==1.5.3
+langchain-core==1.6.3
 # `init_chat_model` — the provider is configuration, not code (llm_provider.py).
-langchain==1.2.10
+langchain==1.4.2
 # [memory] pulls the Lakebase checkpointer/store extras (connection pool with
 # rotating OAuth credentials) — memory.py's production mode depends on them.
 # 0.20+ also carries the Autoscaling-project parameters (autoscaling_endpoint /
 # project / branch) that Lakebase instances of the newer generation need.
 databricks-langchain[memory]==0.20.0
 # 0.89+ for the Autoscaling-generation credential API the Lakebase pool calls.
-databricks-sdk==0.94.0
-databricks-agents==1.11.0
+databricks-sdk==0.140.0
+databricks-agents==1.12.0
 # 3.x removed the shallow savers (unused here) and added the strict-msgpack
 # deserialization guard memory.py turns on.
-langgraph-checkpoint-postgres==3.1.1
+langgraph-checkpoint-postgres==3.1.2
 psycopg[binary]==3.3.4
 pydantic==2.12.5
 PyYAML==6.0.3

@@ -31,14 +31,14 @@ dynamic = ["version"]
 # it is installed from `libs/agent_governance` (see requirements-dev.txt), and
 # baked into the model artifact as a wheel at deploy time.
 dependencies = [
-    "mlflow==3.15.1",
+    "mlflow==3.16.1",
     "langgraph==1.2.11",
-    "langchain-core==1.5.3",
-    "langchain==1.2.10",
+    "langchain-core==1.6.3",
+    "langchain==1.4.2",
     "databricks-langchain[memory]==0.20.0",
-    "databricks-sdk==0.94.0",
-    "databricks-agents==1.11.0",
-    "langgraph-checkpoint-postgres==3.1.1",
+    "databricks-sdk==0.140.0",
+    "databricks-agents==1.12.0",
+    "langgraph-checkpoint-postgres==3.1.2",
     "psycopg[binary]==3.3.4",
     "pydantic==2.12.5",
     "PyYAML==6.0.3",
